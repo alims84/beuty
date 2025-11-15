@@ -16,7 +16,7 @@ def start(update, context):
     )
 
 def main():
-    updater = Updater(TOKEN)
+    updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
     dp.add_handler(CommandHandler("start", start))
     logger.info("🤖 Bot starting...")
