@@ -1,5 +1,2 @@
 python-telegram-bot[job-queue]==22.5
 requests
-git add .
-git commit -m "update gloria_pro pro version"
-git push
