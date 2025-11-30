@@ -1,35 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-Gloria Clinic Telegram Bot - PRO Version (Webhook-ready for Render)
+Gloria Clinic Bot - PRO (Full)
 
-ویژگی‌ها:
 - چند شعبه (کلینیک)
-- رزرو نوبت + یادآوری قبل نوبت + پیام مراقبت بعد درمان + امتیازدهی + Recall
-- پرداخت آفلاین (کارت به کارت) + پرداخت نمایشی آنلاین
-- مشاوره پوستی هوشمند (جواب اختصاصی بر اساس نوع پوست/مشکل/حساسیت)
-- پرونده الکترونیک زیبایی (سوابق نوبت، مشاوره، حساسیت، یادداشت‌های CRM)
-- پکیج درمانی
-- کد معرف / لینک من (Referral) + امتیاز معرف
-- پنل مدیریت با داشبورد، لیست کاربران، نوبت‌ها، پرداخت‌ها، مشاوره‌ها، پکیج‌ها و پیام گروهی
-- آماده‌ی اجرا روی Render به صورت Web Service:
-  * اگر WEBHOOK_URL در env باشد → webhook + پورت
-  * اگر WEBHOOK_URL نباشد → run_polling (برای لوکال)
+- رزرو نوبت + یادآوری قبل از نوبت + Recall دوره‌ای
+- مشاوره پوستی هوشمند (روتین صبح/شب بر اساس نوع پوست/مشکل/حساسیت)
+- پرداخت:
+    • آفلاین (کارت به کارت)
+    • آنلاین (درگاه ایرانی زرین‌پال - سندباکس / تست)
+- CRM:
+    • پرونده الکترونیک بیمار (حساسیت‌ها، یادداشت مهم، سوابق مشاوره و نوبت)
+    • امتیاز معرف (Referral)
+    • پکیج‌های درمانی
+    • پنل مدیریت با داشبورد، لیست کاربران/نوبت‌ها/پرداخت‌ها/مشاوره‌ها/پکیج‌ها، پیام گروهی
+
+برای اجرا روی Render:
+- اگر WEBHOOK_URL ست شده باشد → وبهوک روی همان URL + PORT
+- اگر WEBHOOK_URL ست نباشد → حالت polling (مناسب لوکال)
 """
 
 import logging
 import os
 import sqlite3
+import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, List
 
+import requests
 from telegram import (
+    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    Update,
     ReplyKeyboardRemove,
-    InputMediaPhoto,
 )
 from telegram.ext import (
     Application,
@@ -41,20 +45,16 @@ from telegram.ext import (
     filters,
 )
 
-# ==================== تنظیمات کلی ====================
+# ======================= تنظیمات اصلی =======================
 
 CLINIC_NAME = "Gloria Clinic"
 
-# ⚠️ اگر خواستی توکن را عوض کنی، فقط همین مقدار را عوض کن
+# توکن ربات
 DEFAULT_BOT_TOKEN = "8437924316:AAFysR4_YGYr2HxhxLHWUVAJJdNHSXxNXns"
-
-# اگر در env مقدار TELEGRAM_BOT_TOKEN بود، از آن استفاده می‌کنیم؛
-# وگرنه از مقدار پیش‌فرض بالا
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN تنظیم نشده است و توکن پیش‌فرض هم خالی است.")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN تنظیم نشده است و مقدار پیش‌فرض هم خالی است.")
 
-# مسیر وبهوک (فقط بخش path، بدون دامین)
 WEBHOOK_PATH = f"webhook/{TELEGRAM_BOT_TOKEN.split(':')[0]}"
 
 DB_PATH = "clinic_pro.db"
@@ -63,20 +63,51 @@ DB_PATH = "clinic_pro.db"
 OFFLINE_CARD_NUMBER = "6037-9917-1234-5678"
 OFFLINE_CARD_OWNER = "Gloria Clinic"
 
-# یوزرنیم و پسورد ادمین (می‌توانی تغییر بدهی)
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "1234"
+# ادمین ثابت
+ADMIN_LOGIN_USERNAME = "admin"
+ADMIN_LOGIN_PASSWORD = "12345"
 
-# حداقل فاصله بین نوبت‌ها بر حسب دقیقه (فعلاً فقط برای منطق آینده)
-MIN_SLOT_MINUTES = 30
+# زرین‌پال (سندباکس)
+ZARINPAL_MERCHANT_ID = os.getenv("ZARINPAL_MERCHANT_ID", "").strip()
+ZARINPAL_SANDBOX = True
+ZARINPAL_REQUEST_URL = (
+    "https://sandbox.zarinpal.com/pg/rest/WebGate/PaymentRequest.json"
+    if ZARINPAL_SANDBOX
+    else "https://api.zarinpal.com/pg/v4/payment/request.json"
+)
+ZARINPAL_STARTPAY_URL = (
+    "https://sandbox.zarinpal.com/pg/StartPay/{Authority}"
+    if ZARINPAL_SANDBOX
+    else "https://www.zarinpal.com/pg/StartPay/{Authority}"
+)
 
-# برای امتیاز معرف
+# Referral
 REFERRAL_BONUS_POINTS = 10
-
-# برای دسته‌بندی کاربران
 VIP_THRESHOLD_POINTS = 50
 
-# ==================== دیکشنری‌های ثابت ====================
+# دکتر‌ها و زمان‌ها
+DOCTORS = ["دکتر احمدی", "دکتر رضایی", "دکتر محمدی"]
+TIME_SLOTS = ["10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00"]
+
+# ------------- وضعیت‌ها (state keys) -------------
+
+STATE_AWAITING_ADMIN_USERNAME = "awaiting_admin_username"
+STATE_AWAITING_ADMIN_PASSWORD = "awaiting_admin_password"
+
+STATE_AWAITING_RECEIPT_PHOTO = "awaiting_receipt_photo"
+
+STATE_AWAITING_ALLERGIES = "awaiting_allergies"
+STATE_AWAITING_IMPORTANT_NOTES = "awaiting_important_notes"
+
+STATE_AWAITING_REFERRAL_CODE = "awaiting_referral_code"
+
+STATE_AWAITING_SKIN_TYPE = "awaiting_skin_type"
+STATE_AWAITING_SKIN_CONCERN = "awaiting_skin_concern"
+STATE_AWAITING_SENSITIVITY = "awaiting_sensitivity"
+
+STATE_AWAITING_BROADCAST_TEXT = "awaiting_broadcast_text"
+
+# ------------- مشاوره پوستی -------------
 
 SKIN_TYPES = {
     "dry": "خشک",
@@ -101,116 +132,74 @@ SENSITIVITY_LEVELS = {
     "high": "زیاد",
 }
 
+# چند ترکیب نمونه با پاسخ کاملاً اختصاصی
 TREATMENT_SUGGESTIONS = {
     ("oily", "acne", "high"): {
         "title": "پوست چرب + آکنه فعال + حساسیت زیاد",
         "routine_morning": [
-            "ژل شستشوی ملایم مخصوص پوست‌های چرب و حساس",
+            "ژل شستشوی ملایم مخصوص پوست چرب و حساس (بدون سولفات)",
             "اسپری آب حرارتی یا تونر بدون الکل",
-            "سرم حاوی نیاسینامید ۵٪",
+            "سرم نیاسینامید ۵٪",
             "کرم ضدآفتاب مینرال SPF 50 مخصوص پوست حساس",
         ],
         "routine_night": [
             "شستشوی ملایم",
-            "استفاده از کرم حاوی ترکیبات ضدالتهاب (مثل آلوئه‌ورا، پانتنول)",
-            "هفته‌ای ۲ شب، در صورت تحمل، استفاده از سرم حاوی BHA با درصد پایین",
+            "کرم ضدالتهاب (آلوئه‌ورا، پانتنول، بیزابولول)",
+            "هفته‌ای ۲ شب در صورت تحمل، سرم حاوی BHA با درصد پایین",
         ],
         "clinic_treatments": [
-            "درمان آکنه با لیزر یا نوردرمانی ملایم، در صورت تأیید پزشک",
-            "پاکسازی حرفه‌ای با احتیاط و فاصله مناسب جلسات",
+            "درمان آکنه با نوردرمانی/لیزر ملایم، طبق نظر پزشک",
+            "پاکسازی حرفه‌ای با فاصله زمانی مناسب و بسیار ملایم",
         ],
-        "notes": "در این نوع پوست، هرگونه محصول تحریک‌کننده باید با احتیاط و به تدریج وارد روتین شود.",
+        "notes": "در این نوع پوست، از محصولات الکل‌دار، اسکراب دانه‌دار و شست‌وشوی شدید پرهیز کنید.",
     },
     ("dry", "wrinkles", "low"): {
         "title": "پوست خشک + خطوط ریز + حساسیت کم",
         "routine_morning": [
             "شیرپاک‌کن یا فوم بسیار ملایم",
-            "سرم حاوی هیالورونیک اسید",
-            "کرم مرطوب‌کننده غنی",
-            "کرم ضدآفتاب با فیلترهای فیزیکی و شیمیایی",
+            "سرم هیالورونیک اسید + پپتید",
+            "کرم مرطوب‌کننده غنی (حاوی سرامید)",
+            "کرم ضدآفتاب SPF 50 با فیلترهای ترکیبی",
         ],
         "routine_night": [
             "شستشوی ملایم",
-            "کرم یا سرم حاوی رتینول با دوز کم (در صورت تأیید پزشک)",
-            "کرم مغذی شب",
+            "کرم/سرم حاوی رتینول با دوز پایین (با مشورت پزشک)",
+            "کرم مغذی شب (حاوی روغن‌های سبک و سرامید)",
         ],
         "clinic_treatments": [
             "مزوتراپی آبرسان",
-            "درمان‌های جوانسازی غیرتهاجمی طبق نظر پزشک",
+            "درمان‌های جوانسازی غیرتهاجمی مثل میکرونیدلینگ ملایم یا RF فرکشنال",
         ],
-        "notes": "مصرف آب کافی و پرهیز از شست‌وشوی بیش‌ازحد، برای این نوع پوست بسیار مهم است.",
+        "notes": "شست‌وشوی بیش از حد و آب داغ را محدود کنید و حتماً بعد شست‌وشو تا چند دقیقه کرم بزنید.",
     },
-    # می‌توانی بقیه ترکیب‌ها را هم در آینده اضافه کنی...
+    # می‌توانی در آینده بقیه ترکیب‌ها را هم اضافه کنی
 }
 
+# مراقبت بعد درمان
 POST_CARE_MESSAGES = {
-    "Botox": "مراقبت‌های بعد از بوتاکس:\n- تا ۴ ساعت دراز نکشید.\n- از ماساژ ناحیه تزریق خودداری کنید.\n- در صورت بروز سردرد خفیف، با پزشک مشورت کنید.",
-    "Filler": "مراقبت‌های بعد از فیلر:\n- از کمپرس سرد ملایم استفاده کنید.\n- از لمس و فشار شدید روی ناحیه تزریق خودداری کنید.\n- هرگونه درد یا تورم شدید را به پزشک اطلاع دهید.",
-    "Laser": "مراقبت‌های بعد از لیزر:\n- تا ۴۸ ساعت از قرار گرفتن در معرض آفتاب مستقیم خودداری کنید.\n- از کرم ترمیم‌کننده طبق دستور پزشک استفاده کنید.\n- سونا و استخر فعلاً ممنوع است.",
+    "Botox": "مراقبت‌های بعد از بوتاکس:\n- تا ۴ ساعت دراز نکشید.\n- از ماساژ ناحیه تزریق خودداری کنید.\n- در صورت سردرد یا علائم غیرعادی با پزشک مشورت کنید.",
+    "Filler": "مراقبت‌های بعد از فیلر:\n- استفاده از کمپرس سرد ملایم در ۲۴ ساعت اول.\n- خودداری از فشار و ماساژ شدید ناحیه تزریق.\n- در صورت تورم شدید، با پزشک تماس بگیرید.",
+    "Laser": "مراقبت‌های بعد از لیزر:\n- تا ۴۸ ساعت از آفتاب مستقیم، سونا و استخر پرهیز کنید.\n- استفاده از کرم ترمیم‌کننده طبق نسخه پزشک.\n- کرم ضدآفتاب هر ۲–۳ ساعت تمدید شود.",
+    "Meso": "مراقبت‌های بعد از مزوتراپی:\n- تا ۲۴ ساعت از شستشوی ناحیه تزریق خودداری کنید.\n- از محصولات تحریک‌کننده (اسیدها، رتینول) برای چند روز استفاده نکنید.\n- در صورت قرمزی یا التهاب شدید با پزشک مشورت کنید.",
 }
 
+# برای Recall دوره‌ای
 TREATMENT_RECALL_DAYS = {
-    "Botox": {"tag": "Botox", "recall_days": 180},
-    "Filler": {"tag": "Filler", "recall_days": 270},
-    "Laser": {"tag": "Laser", "recall_days": 45},
-    "Meso": {"tag": "Meso", "recall_days": 90},
+    "Botox": 180,
+    "Filler": 270,
+    "Laser": 45,
+    "Meso": 90,
 }
 
-TREATMENT_PACKAGES = {
-    "laser_6": {
-        "title": "پکیج ۶ جلسه‌ای لیزر",
-        "total_sessions": 6,
-        "description": "مناسب برای لیزر موهای زائد، با ۶ جلسه با فاصله زمانی مناسب.",
-    },
-    "rejuvenation_3": {
-        "title": "پکیج جوانسازی ۳ جلسه‌ای",
-        "total_sessions": 3,
-        "description": "شامل ۳ جلسه جوانسازی غیرتهاجمی برای بهبود بافت و درخشندگی پوست.",
-    },
-}
-
-DOCTORS: List[str] = ["دکتر احمدی", "دکتر رضایی", "دکتر محمدی"]
-
-TIME_SLOTS = ["10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00"]
-
-# state codes
-STATE_AWAITING_NAME = "awaiting_name"
-STATE_AWAITING_CLINIC = "awaiting_clinic"
-STATE_AWAITING_PHONE = "awaiting_phone"
-STATE_ADMIN_USERNAME = "awaiting_admin_username"
-STATE_ADMIN_PASSWORD = "awaiting_admin_password"
-STATE_AWAITING_RECEIPT_PHOTO = "awaiting_receipt_photo"
-STATE_AWAITING_CRM_NOTE = "awaiting_crm_note"
-STATE_AWAITING_ALLERGIES = "awaiting_allergies"
-STATE_AWAITING_IMPORTANT_NOTES = "awaiting_important_notes"
-STATE_AWAITING_REFERRAL_CODE = "awaiting_referral_code"
-
-STATE_AWAITING_SKIN_TYPE = "awaiting_skin_type"
-STATE_AWAITING_SKIN_CONCERN = "awaiting_skin_concern"
-STATE_AWAITING_SENSITIVITY = "awaiting_sensitivity"
-
-STATE_AWAITING_PACKAGE_SELECT = "awaiting_package_select"
-STATE_AWAITING_PACKAGE_ASSIGN_USER = "awaiting_package_assign_user"
-
-STATE_AWAITING_BROADCAST_TEXT = "awaiting_broadcast_text"
-STATE_AWAITING_RATING = "awaiting_rating"
-
-STATE_AWAITING_NEXT_RECALL_DATE = "awaiting_next_recall_date"
-
-# payment statuses
-PAYMENT_STATUS_PENDING = "pending"
-PAYMENT_STATUS_CONFIRMED = "confirmed"
-PAYMENT_STATUS_REJECTED = "rejected"
-
-# ==================== logging ====================
+# ------------- Logging -------------
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# ======================= دیتابیس =======================
 
-# ==================== DB Helpers ====================
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -222,18 +211,16 @@ def init_db():
     conn = get_conn()
     c = conn.cursor()
 
-    # clinics
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS clinics (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
             city TEXT
         )
         """
     )
 
-    # users
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -254,7 +241,6 @@ def init_db():
         """
     )
 
-    # appointments
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS appointments (
@@ -267,16 +253,12 @@ def init_db():
             time TEXT,
             status TEXT DEFAULT 'reserved',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            rating INTEGER,
-            rating_comment TEXT,
-            recall_tag TEXT,
             recall_date TEXT,
             recall_sent INTEGER DEFAULT 0
         )
         """
     )
 
-    # payments
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS payments (
@@ -286,6 +268,8 @@ def init_db():
             amount INTEGER,
             method TEXT,
             status TEXT,
+            gateway TEXT,
+            authority TEXT,
             card_last4 TEXT,
             tracking_code TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -293,7 +277,6 @@ def init_db():
         """
     )
 
-    # consultations
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS consultations (
@@ -309,7 +292,6 @@ def init_db():
         """
     )
 
-    # packages
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS packages (
@@ -324,7 +306,6 @@ def init_db():
         """
     )
 
-    # crm notes
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS crm_notes (
@@ -337,7 +318,6 @@ def init_db():
         """
     )
 
-    # user_states
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS user_states (
@@ -350,8 +330,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
-# ==================== Helper Functions ====================
 
 def get_or_create_user(chat_id: int, full_name: str = "") -> sqlite3.Row:
     conn = get_conn()
@@ -380,7 +358,7 @@ def is_admin(chat_id: int) -> bool:
     return bool(row and row["is_admin"])
 
 
-def set_user_state(chat_id: int, state_key: str, value: Any):
+def set_user_state(chat_id: int, key: str, value: Any):
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM users WHERE chat_id = ?", (chat_id,))
@@ -389,16 +367,13 @@ def set_user_state(chat_id: int, state_key: str, value: Any):
         conn.close()
         return
     user_id = row["id"]
-
     c.execute("SELECT state_json FROM user_states WHERE user_id = ?", (user_id,))
     sr = c.fetchone()
-    import json
-
     if sr and sr["state_json"]:
         data = json.loads(sr["state_json"])
     else:
         data = {}
-    data[state_key] = value
+    data[key] = value
     c.execute(
         "INSERT OR REPLACE INTO user_states (user_id, state_json) VALUES (?, ?)",
         (user_id, json.dumps(data, ensure_ascii=False)),
@@ -407,7 +382,7 @@ def set_user_state(chat_id: int, state_key: str, value: Any):
     conn.close()
 
 
-def get_user_state(chat_id: int, state_key: str, default=None):
+def get_user_state(chat_id: int, key: str, default: Any = None):
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM users WHERE chat_id = ?", (chat_id,))
@@ -418,17 +393,15 @@ def get_user_state(chat_id: int, state_key: str, default=None):
     user_id = row["id"]
     c.execute("SELECT state_json FROM user_states WHERE user_id = ?", (user_id,))
     sr = c.fetchone()
-    import json
-
     if not sr or not sr["state_json"]:
         conn.close()
         return default
     data = json.loads(sr["state_json"])
     conn.close()
-    return data.get(state_key, default)
+    return data.get(key, default)
 
 
-def clear_user_state(chat_id: int, state_key: Optional[str] = None):
+def clear_user_state(chat_id: int, key: Optional[str] = None):
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM users WHERE chat_id = ?", (chat_id,))
@@ -439,16 +412,14 @@ def clear_user_state(chat_id: int, state_key: Optional[str] = None):
     user_id = row["id"]
     c.execute("SELECT state_json FROM user_states WHERE user_id = ?", (user_id,))
     sr = c.fetchone()
-    import json
-
     if not sr or not sr["state_json"]:
         conn.close()
         return
     data = json.loads(sr["state_json"])
-    if state_key is None:
+    if key is None:
         data = {}
     else:
-        data.pop(state_key, None)
+        data.pop(key, None)
     c.execute(
         "UPDATE user_states SET state_json = ? WHERE user_id = ?",
         (json.dumps(data, ensure_ascii=False), user_id),
@@ -457,7 +428,7 @@ def clear_user_state(chat_id: int, state_key: Optional[str] = None):
     conn.close()
 
 
-def get_all_users():
+def get_all_users() -> List[sqlite3.Row]:
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT * FROM users")
@@ -466,113 +437,33 @@ def get_all_users():
     return rows
 
 
-def get_user_by_id(user_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
+# ======================= کیبوردها =======================
 
 
-def get_user_by_chat(chat_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-
-def ensure_admin_user():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1")
-    row = c.fetchone()
-    if not row:
-        c.execute(
-            """
-            INSERT INTO users (chat_id, full_name, phone_number, is_admin)
-            VALUES (?, ?, ?, 1)
-            """,
-            (0, "Super Admin", "",),
-        )
-        conn.commit()
-    conn.close()
-
-
-# ==================== Keyboards ====================
-
-def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
+def main_menu_keyboard(is_admin_user: bool) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("🗓 رزرو نوبت", callback_data="menu_reserve")],
         [InlineKeyboardButton("💳 پرداخت", callback_data="menu_payment")],
         [InlineKeyboardButton("🧴 مشاوره پوستی", callback_data="menu_consult")],
-        [InlineKeyboardButton("📦 پکیج‌های درمانی", callback_data="menu_packages")],
+        [InlineKeyboardButton("📦 پکیج‌ها", callback_data="menu_packages")],
         [InlineKeyboardButton("👤 پروفایل من", callback_data="menu_profile")],
         [InlineKeyboardButton("📣 لینک من / کد معرف", callback_data="menu_referral")],
     ]
     if is_admin_user:
-        buttons.append(
-            [InlineKeyboardButton("🛠 پنل مدیریت", callback_data="menu_admin")]
-        )
+        buttons.append([InlineKeyboardButton("🛠 پنل مدیریت", callback_data="menu_admin")])
     return InlineKeyboardMarkup(buttons)
 
 
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton("📊 داشبورد کلی", callback_data="admin_dashboard")],
-        [InlineKeyboardButton("👥 لیست کاربران", callback_data="admin_users")],
+        [InlineKeyboardButton("📊 داشبورد", callback_data="admin_dashboard")],
+        [InlineKeyboardButton("👥 کاربران", callback_data="admin_users")],
         [InlineKeyboardButton("🗓 نوبت‌ها", callback_data="admin_appointments")],
         [InlineKeyboardButton("💳 پرداخت‌ها", callback_data="admin_payments")],
         [InlineKeyboardButton("🧴 مشاوره‌ها", callback_data="admin_consults")],
         [InlineKeyboardButton("📦 پکیج‌ها", callback_data="admin_packages")],
         [InlineKeyboardButton("📨 پیام گروهی", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("↩️ بازگشت به منوی اصلی", callback_data="back_to_main")],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-def skin_consult_keyboard() -> InlineKeyboardMarkup:
-    skin_type_buttons = [
-        [
-            InlineKeyboardButton("خشک", callback_data="skin_type_dry"),
-            InlineKeyboardButton("چرب", callback_data="skin_type_oily"),
-        ],
-        [
-            InlineKeyboardButton("مختلط", callback_data="skin_type_combination"),
-            InlineKeyboardButton("نرمال", callback_data="skin_type_normal"),
-        ],
-        [InlineKeyboardButton("حساس", callback_data="skin_type_sensitive")],
-    ]
-    return InlineKeyboardMarkup(skin_type_buttons)
-
-
-def skin_concern_keyboard() -> InlineKeyboardMarkup:
-    concern_buttons = [
-        [
-            InlineKeyboardButton("جوش فعال / آکنه", callback_data="concern_acne"),
-            InlineKeyboardButton("لک و تیرگی", callback_data="concern_pigmentation"),
-        ],
-        [
-            InlineKeyboardButton("چروک و خطوط ریز", callback_data="concern_wrinkles"),
-            InlineKeyboardButton("قرمزی و التهاب", callback_data="concern_redness"),
-        ],
-        [
-            InlineKeyboardButton("منافذ باز", callback_data="concern_pores"),
-            InlineKeyboardButton("اسکار و فرورفتگی", callback_data="concern_scars"),
-        ],
-    ]
-    return InlineKeyboardMarkup(concern_buttons)
-
-
-def sensitivity_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton("کم", callback_data="sens_low"),
-            InlineKeyboardButton("متوسط", callback_data="sens_medium"),
-            InlineKeyboardButton("زیاد", callback_data="sens_high"),
-        ]
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -583,18 +474,16 @@ def clinics_keyboard() -> InlineKeyboardMarkup:
     c.execute("SELECT * FROM clinics ORDER BY id ASC")
     rows = c.fetchall()
     conn.close()
-
     if not rows:
-        buttons = [[InlineKeyboardButton("کلینیک پیش‌فرض", callback_data="clinic_1")]]
+        buttons = [[InlineKeyboardButton("کلینیک مرکزی", callback_data="clinic_1")]]
     else:
         buttons = [
             [
                 InlineKeyboardButton(
-                    f"{row['name']} - {row['city']}",
-                    callback_data=f"clinic_{row['id']}",
+                    f"{r['name']} - {r['city']}", callback_data=f"clinic_{r['id']}"
                 )
             ]
-            for row in rows
+            for r in rows
         ]
     return InlineKeyboardMarkup(buttons)
 
@@ -611,44 +500,73 @@ def services_keyboard() -> InlineKeyboardMarkup:
 
 def date_keyboard() -> InlineKeyboardMarkup:
     today = datetime.now().date()
-    buttons = []
+    buttons: List[List[InlineKeyboardButton]] = []
     for i in range(0, 7):
         d = today + timedelta(days=i)
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    d.strftime("%Y-%m-%d"),
-                    callback_data=f"date_{d.strftime('%Y-%m-%d')}",
-                )
-            ]
-        )
+        s = d.strftime("%Y-%m-%d")
+        buttons.append([InlineKeyboardButton(s, callback_data=f"date_{s}")])
     buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")])
     return InlineKeyboardMarkup(buttons)
 
 
 def time_slots_keyboard(selected_date: str) -> InlineKeyboardMarkup:
-    buttons = []
-    for t in TIME_SLOTS:
-        buttons.append(
-            [InlineKeyboardButton(t, callback_data=f"time_{selected_date}_{t}")]
-        )
-    buttons.append(
-        [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_dates")]
+    buttons = [
+        [InlineKeyboardButton(t, callback_data=f"time_{selected_date}_{t}")]
+        for t in TIME_SLOTS
+    ]
+    buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_dates")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def skin_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("خشک", callback_data="skin_type_dry"),
+                InlineKeyboardButton("چرب", callback_data="skin_type_oily"),
+            ],
+            [
+                InlineKeyboardButton("مختلط", callback_data="skin_type_combination"),
+                InlineKeyboardButton("نرمال", callback_data="skin_type_normal"),
+            ],
+            [InlineKeyboardButton("حساس", callback_data="skin_type_sensitive")],
+        ]
     )
-    return InlineKeyboardMarkup(buttons)
 
 
-def packages_keyboard() -> InlineKeyboardMarkup:
-    buttons = []
-    for code, info in TREATMENT_PACKAGES.items():
-        buttons.append(
-            [InlineKeyboardButton(info["title"], callback_data=f"pkg_{code}")]
-        )
-    buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")])
-    return InlineKeyboardMarkup(buttons)
+def skin_concern_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("جوش فعال / آکنه", callback_data="concern_acne"),
+                InlineKeyboardButton("لک و تیرگی", callback_data="concern_pigmentation"),
+            ],
+            [
+                InlineKeyboardButton("چروک/خطوط ریز", callback_data="concern_wrinkles"),
+                InlineKeyboardButton("قرمزی/التهاب", callback_data="concern_redness"),
+            ],
+            [
+                InlineKeyboardButton("منافذ باز", callback_data="concern_pores"),
+                InlineKeyboardButton("اسکار/فرورفتگی", callback_data="concern_scars"),
+            ],
+        ]
+    )
 
 
-# ==================== Text Builders ====================
+def sensitivity_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("کم", callback_data="sens_low"),
+                InlineKeyboardButton("متوسط", callback_data="sens_medium"),
+                InlineKeyboardButton("زیاد", callback_data="sens_high"),
+            ]
+        ]
+    )
+
+
+# ======================= متن‌ها =======================
+
 
 def format_user_profile(user_row: sqlite3.Row) -> str:
     tags = user_row["tags"] or ""
@@ -656,18 +574,18 @@ def format_user_profile(user_row: sqlite3.Row) -> str:
     notes = user_row["important_notes"] or "ثبت نشده"
     ref_code = user_row["referral_code"] or "تعریف نشده"
     points = user_row["referral_points"] or 0
-    is_vip = "✅" if points >= VIP_THRESHOLD_POINTS else "❌"
-
-    text = f"👤 پروفایل شما:\n\n"
-    text += f"نام: {user_row['full_name'] or 'ثبت نشده'}\n"
-    text += f"شماره تماس: {user_row['phone_number'] or 'ثبت نشده'}\n"
-    text += f"برچسب‌ها: {tags}\n"
-    text += f"حساسیت‌ها / آلرژی‌ها: {allergies}\n"
-    text += f"یادداشت‌های مهم: {notes}\n"
-    text += f"کد معرف شما: {ref_code}\n"
-    text += f"امتیاز معرف: {points}\n"
-    text += f"وضعیت VIP: {is_vip}\n"
-    return text
+    vip = "✅" if points >= VIP_THRESHOLD_POINTS else "❌"
+    return (
+        "👤 پروفایل شما:\n\n"
+        f"نام: {user_row['full_name'] or 'ثبت نشده'}\n"
+        f"شماره تماس: {user_row['phone_number'] or 'ثبت نشده'}\n"
+        f"حساسیت‌ها: {allergies}\n"
+        f"یادداشت‌های مهم: {notes}\n"
+        f"کد معرف: {ref_code}\n"
+        f"امتیاز معرف: {points}\n"
+        f"وضعیت VIP: {vip}\n"
+        f"برچسب‌ها: {tags or '-'}\n"
+    )
 
 
 def build_skin_consultation_text(
@@ -675,95 +593,224 @@ def build_skin_consultation_text(
     skin_concern_key: str,
     sensitivity_key: str,
 ) -> Dict[str, str]:
-    base_key = (skin_type_key, skin_concern_key, sensitivity_key)
-    data = TREATMENT_SUGGESTIONS.get(base_key)
-
+    key = (skin_type_key, skin_concern_key, sensitivity_key)
+    data = TREATMENT_SUGGESTIONS.get(key)
     if not data:
         title = "مشاوره پوستی اختصاصی شما"
         body = (
             f"نوع پوست: {SKIN_TYPES.get(skin_type_key, 'نامشخص')}\n"
             f"مشکل اصلی: {SKIN_CONCERNS.get(skin_concern_key, 'نامشخص')}\n"
-            f"میزان حساسیت: {SENSITIVITY_LEVELS.get(sensitivity_key, 'نامشخص')}\n\n"
-            "در حال حاضر دیتا برای این ترکیب به‌صورت اختصاصی تنظیم نشده؛ "
-            "اما می‌توانید با کلینیک برای مشاوره تخصصی تماس بگیرید."
+            f"حساسیت: {SENSITIVITY_LEVELS.get(sensitivity_key, 'نامشخص')}\n\n"
+            "در حال حاضر برای این ترکیب خاص، پروتکل اختصاصی تعریف نشده.\n"
+            "پیشنهاد می‌کنیم برای مشاوره تخصصی، با کلینیک تماس بگیرید 🌸"
         )
         return {"title": title, "body": body}
 
-    text_lines = []
-    text_lines.append(f"✨ {data['title']}\n")
-    text_lines.append("روتین صبح:\n")
-    for step in data["routine_morning"]:
-        text_lines.append(f"• {step}")
-    text_lines.append("\nروتین شب:\n")
-    for step in data["routine_night"]:
-        text_lines.append(f"• {step}")
-    text_lines.append("\nدرمان‌های پیشنهادی در کلینیک:\n")
-    for step in data["clinic_treatments"]:
-        text_lines.append(f"• {step}")
-    text_lines.append(f"\nنکات مهم:\n{data['notes']}")
-
-    return {"title": data["title"], "body": "\n".join(text_lines)}
-
-
-def build_appointment_summary(row: sqlite3.Row) -> str:
-    return (
-        f"📌 نوبت شماره {row['id']}:\n"
-        f"نام خدمت: {row['service_name']}\n"
-        f"تاریخ: {row['date']} - ساعت: {row['time']}\n"
-        f"پزشک: {row['doctor_name']}\n"
-        f"وضعیت: {row['status']}\n"
-    )
+    lines: List[str] = []
+    lines.append(f"✨ {data['title']}\n")
+    lines.append("روتین صبح:\n")
+    for s in data["routine_morning"]:
+        lines.append(f"• {s}")
+    lines.append("\nروتین شب:\n")
+    for s in data["routine_night"]:
+        lines.append(f"• {s}")
+    lines.append("\nدرمان‌های پیشنهادی در کلینیک:\n")
+    for s in data["clinic_treatments"]:
+        lines.append(f"• {s}")
+    lines.append("\nنکات مهم:\n" + data["notes"])
+    return {"title": data["title"], "body": "\n".join(lines)}
 
 
-# ==================== Command Handlers ====================
+# ======================= پرداخت زرین‌پال =======================
+
+
+def create_zarinpal_payment_link(amount: int, description: str) -> Optional[str]:
+    """
+    درخواست لینک پرداخت از زرین‌پال (حالت سندباکس).
+    این تابع فقط لینک را برمی‌گرداند؛ تأیید نهایی پرداخت اینجا انجام نمی‌شود.
+    """
+    if not ZARINPAL_MERCHANT_ID:
+        logger.warning("ZARINPAL_MERCHANT_ID تنظیم نشده است.")
+        return None
+
+    callback_url = "https://example.com/payment/callback"  # در صورت نیاز بعداً می‌تونیم واقعی کنیم
+
+    payload = {
+        "MerchantID": ZARINPAL_MERCHANT_ID,
+        "Amount": amount,
+        "Description": description,
+        "CallbackURL": callback_url,
+        "Email": "",
+        "Mobile": "",
+    }
+    try:
+        r = requests.post(ZARINPAL_REQUEST_URL, json=payload, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        # ساختار سندباکس قدیمی:
+        # { 'Status': 100, 'Authority': 'XXXXXXXXXX' }
+        authority = None
+        status = None
+        if isinstance(data, dict):
+            status = data.get("Status") or data.get("status")
+            authority = data.get("Authority") or (data.get("data") or {}).get("authority")
+        if status == 100 and authority:
+            return ZARINPAL_STARTPAY_URL.format(Authority=authority)
+        logger.warning("Zarinpal response not success: %s", data)
+        return None
+    except Exception as e:
+        logger.exception("خطا در ارتباط با زرین‌پال: %s", e)
+        return None
+
+
+# ======================= فرمان‌ها =======================
+
 
 async def start(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     user = update.effective_user
     full_name = user.full_name
-
     db_user = get_or_create_user(chat_id, full_name)
-    ensure_admin_user()
 
     text = (
         f"سلام {full_name} 🌸\n"
         f"به ربات {CLINIC_NAME} (نسخه PRO) خوش آمدید.\n\n"
-        "لطفاً از منوی زیر گزینه مورد نظر را انتخاب کنید."
+        "از منوی زیر گزینه‌ی مورد نظر را انتخاب کنید."
     )
     await update.message.reply_text(
-        text, reply_markup=main_menu_keyboard(is_admin(db_user["chat_id"]))
+        text, reply_markup=main_menu_keyboard(is_admin(chat_id))
     )
 
 
 async def help_command(update: Update, context: CallbackContext):
-    text = (
-        "راهنمای ربات:\n"
-        "• /start - شروع مجدد\n"
-        "• رزرو نوبت از طریق منوی اصلی\n"
-        "• مشاهده پروفایل و لینک معرف از منوی اصلی\n"
-        "• پنل مدیریت مخصوص ادمین‌ها\n"
+    await update.message.reply_text(
+        "راهنما:\n"
+        "• /start شروع مجدد\n"
+        "• /adminlogin ورود به پنل مدیریت (فقط برای مدیر)\n"
+        "• بقیه تنظیمات از طریق منو انجام می‌شود."
     )
-    await update.message.reply_text(text)
 
 
-# ==================== Callback Router ====================
+async def admin_login_cmd(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    set_user_state(chat_id, STATE_AWAITING_ADMIN_USERNAME, True)
+    await update.message.reply_text("🔐 لطفاً نام کاربری ادمین را وارد کنید:")
+
+
+# ======================= مسیج هندلرها =======================
+
+
+async def handle_text(update: Update, context: CallbackContext):
+    message = update.message
+    text = message.text.strip()
+    chat_id = message.chat_id
+
+    # ادمین لاگین
+    if get_user_state(chat_id, STATE_AWAITING_ADMIN_USERNAME):
+        clear_user_state(chat_id, STATE_AWAITING_ADMIN_USERNAME)
+        set_user_state(chat_id, STATE_AWAITING_ADMIN_PASSWORD, text)
+        await message.reply_text("لطفاً رمز عبور ادمین را وارد کنید:")
+        return
+
+    if get_user_state(chat_id, STATE_AWAITING_ADMIN_PASSWORD):
+        username = get_user_state(chat_id, STATE_AWAITING_ADMIN_PASSWORD)
+        clear_user_state(chat_id, STATE_AWAITING_ADMIN_PASSWORD)
+        if username == ADMIN_LOGIN_USERNAME and text == ADMIN_LOGIN_PASSWORD:
+            conn = get_conn()
+            conn.execute(
+                "UPDATE users SET is_admin = 1 WHERE chat_id = ?", (chat_id,)
+            )
+            conn.commit()
+            conn.close()
+            await message.reply_text(
+                "✅ ورود موفق به پنل مدیریت.\n"
+                "از منوی اصلی دکمه «🛠 پنل مدیریت» را خواهید دید.",
+                reply_markup=main_menu_keyboard(True),
+            )
+        else:
+            await message.reply_text("❌ نام کاربری یا رمز عبور اشتباه است.")
+        return
+
+    # ثبت آلرژی
+    if get_user_state(chat_id, STATE_AWAITING_ALLERGIES):
+        clear_user_state(chat_id, STATE_AWAITING_ALLERGIES)
+        conn = get_conn()
+        conn.execute(
+            "UPDATE users SET allergies = ? WHERE chat_id = ?", (text, chat_id)
+        )
+        conn.commit()
+        conn.close()
+        await message.reply_text("✅ حساسیت‌ها/آلرژی‌ها ذخیره شد.")
+        return
+
+    # یادداشت مهم
+    if get_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES):
+        clear_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES)
+        conn = get_conn()
+        conn.execute(
+            "UPDATE users SET important_notes = ? WHERE chat_id = ?",
+            (text, chat_id),
+        )
+        conn.commit()
+        conn.close()
+        await message.reply_text("✅ یادداشت در پرونده شما ذخیره شد.")
+        return
+
+    # کد معرف
+    if get_user_state(chat_id, STATE_AWAITING_REFERRAL_CODE):
+        await save_referral_from_text(update, text)
+        return
+
+    # پیام گروهی
+    if get_user_state(chat_id, STATE_AWAITING_BROADCAST_TEXT) and is_admin(chat_id):
+        await handle_broadcast_text(update, text)
+        return
+
+    await message.reply_text("پیام شما دریافت شد. برای استفاده از امکانات، از منو استفاده کنید.")
+
+
+async def handle_contact(update: Update, context: CallbackContext):
+    contact = update.message.contact
+    chat_id = update.message.chat_id
+    conn = get_conn()
+    conn.execute(
+        "UPDATE users SET phone_number = ? WHERE chat_id = ?",
+        (contact.phone_number, chat_id),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("✅ شماره تماس شما ذخیره شد.")
+
+
+async def handle_photo(update: Update, context: CallbackContext):
+    chat_id = update.message.chat_id
+    if get_user_state(chat_id, STATE_AWAITING_RECEIPT_PHOTO):
+        clear_user_state(chat_id, STATE_AWAITING_RECEIPT_PHOTO)
+        await update.message.reply_text(
+            "✅ تصویر رسید دریافت شد.\n"
+            "پس از بررسی ادمین، وضعیت پرداخت در سیستم به‌روزرسانی می‌شود."
+        )
+    else:
+        await update.message.reply_text("عکس شما دریافت شد.")
+
+
+# ======================= Callback Router =======================
+
 
 async def callback_router(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
-
     data = query.data
     chat_id = query.message.chat_id
-
     user_row = get_or_create_user(chat_id, query.from_user.full_name)
-    admin_flag = is_admin(chat_id)
 
+    # منوی اصلی
     if data == "menu_reserve":
         await show_reserve_menu(query, user_row)
     elif data == "menu_payment":
         await show_payment_menu(query, user_row)
     elif data == "menu_consult":
-        await start_skin_consult(query, user_row)
+        await start_skin_consult(query)
     elif data == "menu_packages":
         await show_packages_menu(query, user_row)
     elif data == "menu_profile":
@@ -771,208 +818,140 @@ async def callback_router(update: Update, context: CallbackContext):
     elif data == "menu_referral":
         await show_referral_menu(query, user_row)
     elif data == "menu_admin":
-        if admin_flag:
+        if is_admin(chat_id):
             await show_admin_menu(query)
         else:
-            await query.message.reply_text("شما دسترسی ادمین ندارید.")
+            await query.message.reply_text("❌ شما دسترسی ادمین ندارید.")
 
+    # رزرو
     elif data.startswith("clinic_"):
         await handle_clinic_select(query, data, user_row)
-
     elif data.startswith("service_"):
         await handle_service_select(query, data, user_row)
-
-    elif data == "back_to_main":
-        await query.message.edit_text(
-            "بازگشت به منوی اصلی ✅",
-            reply_markup=main_menu_keyboard(admin_flag),
-        )
-
-    elif data == "admin_dashboard":
-        if admin_flag:
-            await show_admin_dashboard(query)
-    elif data == "admin_users":
-        if admin_flag:
-            await show_admin_users(query)
-    elif data == "admin_appointments":
-        if admin_flag:
-            await show_admin_appointments(query)
-    elif data == "admin_payments":
-        if admin_flag:
-            await show_admin_payments(query)
-    elif data == "admin_consults":
-        if admin_flag:
-            await show_admin_consults(query)
-    elif data == "admin_packages":
-        if admin_flag:
-            await show_admin_packages(query)
-    elif data == "admin_broadcast":
-        if admin_flag:
-            await ask_broadcast_text(query)
-
     elif data.startswith("date_"):
         await handle_date_select(query, data, user_row)
-
     elif data.startswith("time_"):
         await handle_time_select(query, data, user_row)
 
-    elif data == "offline_payment":
-        await show_offline_payment_instructions(query, user_row)
+    elif data == "back_to_dates":
+        await query.message.edit_text(
+            "تاریخ را انتخاب کنید:", reply_markup=date_keyboard()
+        )
+        return
 
+    elif data == "back_to_main":
+        await query.message.edit_text(
+            "بازگشت به منوی اصلی:",
+            reply_markup=main_menu_keyboard(is_admin(chat_id)),
+        )
+        return
+
+    # پرداخت
+    elif data == "payment_offline":
+        await show_offline_payment(query, user_row)
+    elif data == "payment_online":
+        await show_online_payment(query, user_row)
+
+    # مشاوره پوستی
     elif data.startswith("skin_type_"):
         await handle_skin_type_select(query, data, user_row)
-
     elif data.startswith("concern_"):
         await handle_skin_concern_select(query, data, user_row)
-
     elif data.startswith("sens_"):
         await handle_sensitivity_select(query, data, user_row)
 
-    elif data.startswith("pkg_"):
-        await handle_package_select(query, data, user_row)
-
+    # Referral
     elif data == "enter_referral":
         await ask_referral_code(query, user_row)
-
     elif data == "my_referral_link":
         await show_my_referral_link(query, user_row)
 
+    # پروفایل - آلرژی و یادداشت
     elif data == "enter_allergies":
-        await ask_allergies(query, user_row)
-
+        await ask_allergies(query)
     elif data == "enter_important_notes":
-        await ask_important_notes(query, user_row)
+        await ask_important_notes(query)
+
+    # Admin
+    elif data == "admin_dashboard" and is_admin(chat_id):
+        await show_admin_dashboard(query)
+    elif data == "admin_users" and is_admin(chat_id):
+        await show_admin_users(query)
+    elif data == "admin_appointments" and is_admin(chat_id):
+        await show_admin_appointments(query)
+    elif data == "admin_payments" and is_admin(chat_id):
+        await show_admin_payments(query)
+    elif data == "admin_consults" and is_admin(chat_id):
+        await show_admin_consults(query)
+    elif data == "admin_packages" and is_admin(chat_id):
+        await show_admin_packages(query)
+    elif data == "admin_broadcast" and is_admin(chat_id):
+        await ask_broadcast_text(query)
 
 
-# ==================== Message Handlers ====================
+# ======================= رزرو نوبت =======================
 
-async def handle_text(update: Update, context: CallbackContext):
-    message = update.message
-    chat_id = message.chat_id
-    text = message.text.strip()
-
-    state_referral = get_user_state(chat_id, STATE_AWAITING_REFERRAL_CODE)
-    state_broadcast = get_user_state(chat_id, STATE_AWAITING_BROADCAST_TEXT)
-    state_allergies = get_user_state(chat_id, STATE_AWAITING_ALLERGIES)
-    state_notes = get_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES)
-
-    if state_referral:
-        await save_referral_code_from_text(update, text)
-        return
-
-    if state_broadcast and is_admin(chat_id):
-        await handle_broadcast_text(update, text)
-        return
-
-    if state_allergies:
-        await save_allergies_from_text(update, text)
-        return
-
-    if state_notes:
-        await save_important_notes_from_text(update, text)
-        return
-
-    await update.message.reply_text(
-        "پیام شما دریافت شد. برای استفاده از امکانات ربات، از منو استفاده کنید."
-    )
-
-
-async def handle_contact(update: Update, context: CallbackContext):
-    contact = update.message.contact
-    chat_id = update.message.chat_id
-
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE users SET phone_number = ? WHERE chat_id = ?",
-        (contact.phone_number, chat_id),
-    )
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text("شماره تماس شما با موفقیت ثبت شد ✅")
-
-
-async def handle_photo(update: Update, context: CallbackContext):
-    chat_id = update.message.chat_id
-    state_receipt = get_user_state(chat_id, STATE_AWAITING_RECEIPT_PHOTO)
-
-    if state_receipt:
-        await update.message.reply_text(
-            "رسید پرداخت شما دریافت شد ✅\n"
-            "ادمین بعد از بررسی، وضعیت پرداخت را در سیستم تأیید می‌کند."
-        )
-        clear_user_state(chat_id, STATE_AWAITING_RECEIPT_PHOTO)
-        return
-
-    await update.message.reply_text(
-        "عکس شما دریافت شد، ولی در حال حاضر در حالتی نیستید که رسید پرداخت ثبت شود."
-    )
-
-
-# ==================== Feature: رزرو نوبت ====================
 
 async def show_reserve_menu(query, user_row):
-    text = (
-        "🗓 رزرو نوبت:\n\n"
-        "ابتدا کلینیک را انتخاب کنید."
-    )
+    text = "🗓 رزرو نوبت:\n\nابتدا شعبه/کلینیک را انتخاب کنید."
     await query.message.edit_text(text, reply_markup=clinics_keyboard())
 
 
 async def handle_clinic_select(query, data: str, user_row):
     clinic_id = int(data.split("_")[1])
     chat_id = query.message.chat_id
-
     set_user_state(chat_id, "selected_clinic_id", clinic_id)
-
-    text = "نوع خدمت مورد نظر را انتخاب کنید:"
-    await query.message.edit_text(text, reply_markup=services_keyboard())
+    await query.message.edit_text("نوع خدمت را انتخاب کنید:", reply_markup=services_keyboard())
 
 
 async def handle_service_select(query, data: str, user_row):
-    service_code = data.split("_", 1)[1]
+    service_code = data.split("_", 1)[1]  # Botox/Filler/...
     chat_id = query.message.chat_id
-
     set_user_state(chat_id, "selected_service_code", service_code)
-
-    text = "لطفاً تاریخ مراجعه را انتخاب کنید:"
-    await query.message.edit_text(text, reply_markup=date_keyboard())
+    await query.message.edit_text("تاریخ مراجعه را انتخاب کنید:", reply_markup=date_keyboard())
 
 
 async def handle_date_select(query, data: str, user_row):
     _, date_str = data.split("_", 1)
     chat_id = query.message.chat_id
     set_user_state(chat_id, "selected_date", date_str)
-    text = f"تاریخ انتخاب‌شده: {date_str}\n\nلطفاً ساعت را انتخاب کنید:"
-    await query.message.edit_text(text, reply_markup=time_slots_keyboard(date_str))
+    await query.message.edit_text(
+        f"تاریخ انتخاب‌شده: {date_str}\n\nلطفاً ساعت را انتخاب کنید:",
+        reply_markup=time_slots_keyboard(date_str),
+    )
 
 
 async def handle_time_select(query, data: str, user_row):
-    parts = data.split("_", 2)
-    _, date_str, time_str = parts
+    _, date_str, time_str = data.split("_", 2)
     chat_id = query.message.chat_id
 
     clinic_id = get_user_state(chat_id, "selected_clinic_id")
     service_code = get_user_state(chat_id, "selected_service_code")
-
     if not clinic_id or not service_code:
-        await query.message.edit_text("❌ خطا: اطلاعات نوبت کامل نیست. دوباره تلاش کنید.")
+        await query.message.edit_text("❌ اطلاعات نوبت کامل نیست. لطفاً از اول رزرو را شروع کنید.")
         return
 
-    service_name = {
+    service_name_map = {
         "Botox": "بوتاکس",
         "Filler": "فیلر",
         "Laser": "لیزر",
         "Meso": "مزوتراپی",
-    }.get(service_code, service_code)
+    }
+    service_name = service_name_map.get(service_code, service_code)
+
+    # تعیین تاریخ Recall
+    recall_days = TREATMENT_RECALL_DAYS.get(service_code, 0)
+    recall_date = None
+    if recall_days > 0:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date() + timedelta(days=recall_days)
+        recall_date = d.strftime("%Y-%m-%d")
 
     conn = get_conn()
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO appointments (user_id, clinic_id, service_name, doctor_name, date, time)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO appointments (user_id, clinic_id, service_name, doctor_name, date, time, recall_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_row["id"],
@@ -981,81 +960,106 @@ async def handle_time_select(query, data: str, user_row):
             DOCTORS[0],
             date_str,
             time_str,
+            recall_date,
         ),
     )
     conn.commit()
-    appointment_id = c.lastrowid
+    app_id = c.lastrowid
     conn.close()
 
-    summary = (
-        f"✅ نوبت شما ثبت شد.\n\n"
-        f"شماره نوبت: {appointment_id}\n"
+    text = (
+        "✅ نوبت شما ثبت شد.\n\n"
+        f"شماره نوبت: {app_id}\n"
         f"خدمت: {service_name}\n"
         f"تاریخ: {date_str}\n"
         f"ساعت: {time_str}\n"
-        f"پزشک: {DOCTORS[0]}\n\n"
-        "برای مشاهده نوبت‌های بعدی، از منوی اصلی استفاده کنید."
+        f"پزشک: {DOCTORS[0]}\n"
+    )
+    if recall_date:
+        text += f"\n📅 زمان مناسب برای یادآوری جلسه بعدی: {recall_date}"
+
+    await query.message.edit_text(
+        text, reply_markup=main_menu_keyboard(is_admin(chat_id))
     )
 
-    await query.message.edit_text(summary, reply_markup=main_menu_keyboard(is_admin(chat_id)))
 
+# ======================= پرداخت =======================
 
-# ==================== Feature: پرداخت ====================
 
 async def show_payment_menu(query, user_row):
     text = (
-        "💳 پرداخت هزینه خدمات:\n\n"
-        "در این نسخه، پرداخت آنلاین به‌صورت نمایشی است و پول واقعی جابه‌جا نمی‌شود.\n"
-        "برای تست و استفاده:\n"
-        "• پرداخت آفلاین (کارت به کارت) را انتخاب کنید.\n"
+        "💳 پرداخت خدمات:\n\n"
+        "می‌توانید پرداخت خود را به‌صورت آفلاین (کارت به کارت) یا از طریق درگاه ایرانی (حالت تستی) انجام دهید."
     )
     buttons = [
-        [InlineKeyboardButton("پرداخت آفلاین (کارت به کارت)", callback_data="offline_payment")],
+        [InlineKeyboardButton("پرداخت آفلاین (کارت به کارت)", callback_data="payment_offline")],
+        [InlineKeyboardButton("پرداخت آنلاین (درگاه ایرانی - تست)", callback_data="payment_online")],
         [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
     ]
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def show_offline_payment_instructions(query, user_row):
+async def show_offline_payment(query, user_row):
+    chat_id = query.message.chat_id
+    set_user_state(chat_id, STATE_AWAITING_RECEIPT_PHOTO, True)
     text = (
         "💳 پرداخت آفلاین (کارت به کارت):\n\n"
         f"شماره کارت:\n{OFFLINE_CARD_NUMBER}\n"
         f"به نام: {OFFLINE_CARD_OWNER}\n\n"
-        "بعد از انجام واریز، لطفاً تصویر رسید را برای ربات ارسال کنید "
-        "تا توسط ادمین بررسی و تأیید شود."
+        "پس از واریز، تصویر رسید را برای ربات ارسال کنید."
     )
-    set_user_state(query.message.chat_id, STATE_AWAITING_RECEIPT_PHOTO, True)
     await query.message.edit_text(text)
 
 
-# ==================== Feature: مشاوره پوستی هوشمند ====================
+async def show_online_payment(query, user_row):
+    chat_id = query.message.chat_id
+    amount = 500000  # مثال: ۵۰ هزار تومان = ۵۰۰۰۰۰ ریال
+    description = f"پرداخت خدمات {CLINIC_NAME}"
 
-async def start_skin_consult(query, user_row):
+    link = create_zarinpal_payment_link(amount, description)
+    if not link:
+        await query.message.edit_text(
+            "❌ در حال حاضر امکان اتصال به درگاه پرداخت فراهم نیست.\n"
+            "می‌توانید از روش کارت به کارت استفاده کنید."
+        )
+        return
+
+    text = (
+        "💳 پرداخت آنلاین (درگاه ایرانی - تست):\n\n"
+        "برای ادامه پرداخت روی لینک زیر کلیک کنید:\n"
+        f"{link}\n\n"
+        "پس از تکمیل پرداخت، در این نسخه از ربات، وضعیت به‌صورت دستی توسط کلینیک بررسی می‌شود."
+    )
+    await query.message.edit_text(text)
+
+
+# ======================= مشاوره پوستی =======================
+
+
+async def start_skin_consult(query):
     chat_id = query.message.chat_id
     clear_user_state(chat_id, STATE_AWAITING_SKIN_TYPE)
     clear_user_state(chat_id, STATE_AWAITING_SKIN_CONCERN)
     clear_user_state(chat_id, STATE_AWAITING_SENSITIVITY)
-
-    text = "لطفاً نوع پوست خود را انتخاب کنید:"
-    await query.message.edit_text(text, reply_markup=skin_consult_keyboard())
+    await query.message.edit_text("ابتدا نوع پوست خود را انتخاب کنید:", reply_markup=skin_type_keyboard())
 
 
 async def handle_skin_type_select(query, data: str, user_row):
     chat_id = query.message.chat_id
     skin_type_key = data.split("_", 2)[2]
     set_user_state(chat_id, "skin_type_key", skin_type_key)
-
-    text = "مشکل اصلی پوست خود را انتخاب کنید:"
-    await query.message.edit_text(text, reply_markup=skin_concern_keyboard())
+    await query.message.edit_text(
+        "مشکل اصلی پوست خود را انتخاب کنید:", reply_markup=skin_concern_keyboard()
+    )
 
 
 async def handle_skin_concern_select(query, data: str, user_row):
     chat_id = query.message.chat_id
-    concern_key = data.split("_", 1)[1]
+    concern_key = data.split("_", 1)[1]  # acne/...
     set_user_state(chat_id, "skin_concern_key", concern_key)
-
-    text = "میزان حساسیت پوست خود را مشخص کنید:"
-    await query.message.edit_text(text, reply_markup=sensitivity_keyboard())
+    await query.message.edit_text(
+        "میزان حساسیت پوست خود را مشخص کنید:", reply_markup=sensitivity_keyboard()
+    )
 
 
 async def handle_sensitivity_select(query, data: str, user_row):
@@ -1064,96 +1068,68 @@ async def handle_sensitivity_select(query, data: str, user_row):
 
     skin_type_key = get_user_state(chat_id, "skin_type_key")
     skin_concern_key = get_user_state(chat_id, "skin_concern_key")
-
     if not skin_type_key or not skin_concern_key:
         await query.message.edit_text("❌ اطلاعات مشاوره کامل نیست. لطفاً از ابتدا شروع کنید.")
         return
 
-    consult_data = build_skin_consultation_text(
-        skin_type_key, skin_concern_key, sens_key
-    )
+    consult = build_skin_consultation_text(skin_type_key, skin_concern_key, sens_key)
 
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
+    conn.execute(
         """
         INSERT INTO consultations (
             user_id, skin_type_key, skin_concern_key, sensitivity_key,
             suggestion_title, suggestion_text
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             user_row["id"],
             skin_type_key,
             skin_concern_key,
             sens_key,
-            consult_data["title"],
-            consult_data["body"],
+            consult["title"],
+            consult["body"],
         ),
     )
     conn.commit()
     conn.close()
 
     await query.message.edit_text(
-        f"📋 {consult_data['title']}\n\n{consult_data['body']}",
+        f"📋 {consult['title']}\n\n{consult['body']}",
         reply_markup=main_menu_keyboard(is_admin(chat_id)),
     )
 
 
-# ==================== Feature: پکیج‌ها ====================
+# ======================= پروفایل و Referral =======================
 
-async def show_packages_menu(query, user_row):
-    text = "📦 پکیج‌های درمانی در دسترس:"
-    await query.message.edit_text(text, reply_markup=packages_keyboard())
-
-
-async def handle_package_select(query, data: str, user_row):
-    pkg_code = data.split("_", 1)[1]
-    info = TREATMENT_PACKAGES.get(pkg_code)
-    if not info:
-        await query.message.edit_text("❌ پکیج انتخاب‌شده معتبر نیست.")
-        return
-
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO packages (user_id, package_code, title, total_sessions)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            user_row["id"],
-            pkg_code,
-            info["title"],
-            info["total_sessions"],
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    text = (
-        f"✅ پکیج «{info['title']}» برای شما ثبت شد.\n"
-        f"تعداد جلسات: {info['total_sessions']}\n"
-        "در هر مراجعه، تعداد جلسات استفاده‌شده توسط کلینیک به‌روزرسانی می‌شود."
-    )
-    await query.message.edit_text(
-        text,
-        reply_markup=main_menu_keyboard(is_admin(query.message.chat_id)),
-    )
-
-
-async def show_profile(query, user_row):
-    text = format_user_profile(user_row)
-    await query.message.edit_text(
-        text, reply_markup=main_menu_keyboard(is_admin(query.message.chat_id))
-    )
-
-
-# ==================== Feature: Referral / لینک من ====================
 
 def generate_referral_code(user_id: int) -> str:
     return f"GLR{user_id:05d}"
+
+
+async def show_profile(query, user_row):
+    chat_id = query.message.chat_id
+    text = format_user_profile(user_row)
+    buttons = [
+        [
+            InlineKeyboardButton("حساسیت‌ها / آلرژی‌ها", callback_data="enter_allergies"),
+            InlineKeyboardButton("یادداشت مهم", callback_data="enter_important_notes"),
+        ],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
+    ]
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def ask_allergies(query):
+    chat_id = query.message.chat_id
+    set_user_state(chat_id, STATE_AWAITING_ALLERGIES, True)
+    await query.message.edit_text("حساسیت‌ها و آلرژی‌های مهم خود را وارد کنید:")
+
+
+async def ask_important_notes(query):
+    chat_id = query.message.chat_id
+    set_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES, True)
+    await query.message.edit_text("یادداشت‌های مهم درباره‌ی وضعیت پوستی یا پزشکی خود را وارد کنید:")
 
 
 async def show_referral_menu(query, user_row):
@@ -1166,10 +1142,8 @@ async def show_referral_menu(query, user_row):
     )
     row = c.fetchone()
     conn.close()
-
     ref_code = row["referral_code"]
     points = row["referral_points"] or 0
-
     if not ref_code:
         ref_code = generate_referral_code(user_row["id"])
         conn2 = get_conn()
@@ -1180,15 +1154,14 @@ async def show_referral_menu(query, user_row):
         conn2.commit()
         conn2.close()
 
-    # لینک دعوت (domain/username واقعی بات را باید از BotFather و تنظیمات Render بگیری)
-    referral_link = f"https://t.me/{CLINIC_NAME.replace(' ', '')}_bot?start={ref_code}"
+    referral_link = f"https://t.me/GloriaClinicBot?start={ref_code}"
 
     text = (
         "📣 لینک من / کد معرف:\n\n"
         f"کد معرف شما: {ref_code}\n"
-        f"امتیازهای فعلی: {points}\n\n"
+        f"امتیاز معرف فعلی: {points}\n\n"
         f"لینک دعوت (نمونه):\n{referral_link}\n\n"
-        "این لینک را برای دوستان خود بفرستید؛ در صورت ثبت‌نام، امتیاز دریافت می‌کنید."
+        "با اشتراک این لینک، در صورت ثبت‌نام دوستانتان، امتیاز دریافت می‌کنید."
     )
     buttons = [
         [InlineKeyboardButton("ثبت کد معرف دیگران", callback_data="enter_referral")],
@@ -1200,22 +1173,19 @@ async def show_referral_menu(query, user_row):
 async def ask_referral_code(query, user_row):
     chat_id = query.message.chat_id
     set_user_state(chat_id, STATE_AWAITING_REFERRAL_CODE, True)
-    await query.message.edit_text(
-        "لطفاً کد معرف دوست خود را ارسال کنید (مثلاً: GLR00012)."
-    )
+    await query.message.edit_text("کد معرف دوست خود را وارد کنید (مثلاً GLR00012):")
 
 
-async def save_referral_code_from_text(update: Update, text: str):
+async def save_referral_from_text(update: Update, text: str):
     chat_id = update.message.chat_id
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, referral_code, referred_by_user_id FROM users WHERE chat_id = ?", (chat_id,))
+    c.execute("SELECT id, referred_by_user_id FROM users WHERE chat_id = ?", (chat_id,))
     row = c.fetchone()
-
     if not row:
         conn.close()
         clear_user_state(chat_id, STATE_AWAITING_REFERRAL_CODE)
-        await update.message.reply_text("❌ خطا در یافتن پروفایل کاربر.")
+        await update.message.reply_text("❌ خطا در یافتن کاربر.")
         return
 
     if row["referred_by_user_id"]:
@@ -1225,7 +1195,6 @@ async def save_referral_code_from_text(update: Update, text: str):
         return
 
     ref_code = text.strip().upper()
-
     c.execute("SELECT id FROM users WHERE referral_code = ?", (ref_code,))
     ref_row = c.fetchone()
     if not ref_row:
@@ -1235,7 +1204,7 @@ async def save_referral_code_from_text(update: Update, text: str):
 
     if ref_row["id"] == row["id"]:
         conn.close()
-        await update.message.reply_text("نمی‌توانید خودتان را به عنوان معرف ثبت کنید.")
+        await update.message.reply_text("نمی‌توانید خودتان را به‌عنوان معرف ثبت کنید.")
         return
 
     c.execute(
@@ -1248,62 +1217,16 @@ async def save_referral_code_from_text(update: Update, text: str):
     )
     conn.commit()
     conn.close()
-
     clear_user_state(chat_id, STATE_AWAITING_REFERRAL_CODE)
-    await update.message.reply_text(
-        "✅ کد معرف با موفقیت ثبت شد. از همراهی شما سپاسگزاریم."
-    )
+    await update.message.reply_text("✅ کد معرف با موفقیت ثبت شد.")
 
 
 async def show_my_referral_link(query, user_row):
     await show_referral_menu(query, user_row)
 
 
-# ==================== Feature: Allergies & Notes ====================
+# ======================= Admin Panel =======================
 
-async def ask_allergies(query, user_row):
-    chat_id = query.message.chat_id
-    set_user_state(chat_id, STATE_AWAITING_ALLERGIES, True)
-    await query.message.edit_text(
-        "لطفاً حساسیت‌ها و آلرژی‌های مهم خود را به‌صورت متنی وارد کنید."
-    )
-
-
-async def save_allergies_from_text(update: Update, text: str):
-    chat_id = update.message.chat_id
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE users SET allergies = ? WHERE chat_id = ?", (text, chat_id))
-    conn.commit()
-    conn.close()
-
-    clear_user_state(chat_id, STATE_AWAITING_ALLERGIES)
-    await update.message.reply_text("✅ حساسیت‌ها/آلرژی‌ها با موفقیت ثبت شد.")
-
-
-async def ask_important_notes(query, user_row):
-    chat_id = query.message.chat_id
-    set_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES, True)
-    await query.message.edit_text(
-        "لطفاً یادداشت‌های مهم (مثلاً نکات مربوط به پوست، ترجیحات، یا نکات پزشکی) را وارد کنید."
-    )
-
-
-async def save_important_notes_from_text(update: Update, text: str):
-    chat_id = update.message.chat_id
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE users SET important_notes = ? WHERE chat_id = ?", (text, chat_id)
-    )
-    conn.commit()
-    conn.close()
-
-    clear_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES)
-    await update.message.reply_text("✅ یادداشت‌های مهم در پروفایل شما ذخیره شد.")
-
-
-# ==================== Feature: Admin Panel ====================
 
 async def show_admin_menu(query):
     await query.message.edit_text("🛠 پنل مدیریت:", reply_markup=admin_menu_keyboard())
@@ -1312,14 +1235,13 @@ async def show_admin_menu(query):
 async def show_admin_dashboard(query):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) as cnt FROM users")
+    c.execute("SELECT COUNT(*) AS cnt FROM users")
     users_cnt = c.fetchone()["cnt"]
-    c.execute("SELECT COUNT(*) as cnt FROM appointments")
+    c.execute("SELECT COUNT(*) AS cnt FROM appointments")
     app_cnt = c.fetchone()["cnt"]
-    c.execute("SELECT COUNT(*) as cnt FROM payments")
+    c.execute("SELECT COUNT(*) AS cnt FROM payments")
     pay_cnt = c.fetchone()["cnt"]
     conn.close()
-
     text = (
         "📊 داشبورد کلی:\n\n"
         f"تعداد کاربران: {users_cnt}\n"
@@ -1335,17 +1257,15 @@ async def show_admin_users(query):
     c.execute("SELECT * FROM users ORDER BY id DESC LIMIT 20")
     rows = c.fetchall()
     conn.close()
-
     if not rows:
-        text = "👥 هنوز کاربری ثبت نشده است."
+        text = "کاربری ثبت نشده است."
     else:
-        lines = ["👥 آخرین کاربران ثبت‌شده:\n"]
+        lines = ["👥 آخرین کاربران:\n"]
         for r in rows:
             lines.append(
-                f"- [{r['id']}] {r['full_name']} / {r['phone_number'] or 'بدون شماره'} / امتیاز معرف: {r['referral_points']}"
+                f"- #{r['id']} | {r['full_name']} | {r['phone_number'] or 'بدون شماره'} | امتیاز: {r['referral_points']}"
             )
         text = "\n".join(lines)
-
     await query.message.edit_text(text, reply_markup=admin_menu_keyboard())
 
 
@@ -1362,7 +1282,6 @@ async def show_admin_appointments(query):
     )
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         text = "🗓 هنوز نوبتی ثبت نشده است."
     else:
@@ -1372,7 +1291,6 @@ async def show_admin_appointments(query):
                 f"- #{r['id']} | {r['full_name']} | {r['service_name']} | {r['date']} {r['time']} | وضعیت: {r['status']}"
             )
         text = "\n".join(lines)
-
     await query.message.edit_text(text, reply_markup=admin_menu_keyboard())
 
 
@@ -1389,17 +1307,15 @@ async def show_admin_payments(query):
     )
     rows = c.fetchall()
     conn.close()
-
     if not rows:
-        text = "💳 هنوز پرداختی ثبت نشده است."
+        text = "💳 پرداختی ثبت نشده است."
     else:
         lines = ["💳 آخرین پرداخت‌ها:\n"]
         for r in rows:
             lines.append(
-                f"- #{r['id']} | {r['full_name']} | مبلغ: {r['amount']} | وضعیت: {r['status']} | روش: {r['method']}"
+                f"- #{r['id']} | {r['full_name']} | مبلغ: {r['amount']} | روش: {r['method']} | وضعیت: {r['status']}"
             )
         text = "\n".join(lines)
-
     await query.message.edit_text(text, reply_markup=admin_menu_keyboard())
 
 
@@ -1416,17 +1332,15 @@ async def show_admin_consults(query):
     )
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         text = "🧴 هنوز مشاوره‌ای ثبت نشده است."
     else:
         lines = ["🧴 آخرین مشاوره‌ها:\n"]
         for r in rows:
             lines.append(
-                f"- #{r['id']} | {r['full_name']} | {r['suggestion_title']} | {r['created_at']}"
+                f"- #{r['id']} | {r['full_name']} | {r['suggestion_title']}"
             )
         text = "\n".join(lines)
-
     await query.message.edit_text(text, reply_markup=admin_menu_keyboard())
 
 
@@ -1443,7 +1357,6 @@ async def show_admin_packages(query):
     )
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         text = "📦 هنوز پکیجی ثبت نشده است."
     else:
@@ -1453,7 +1366,6 @@ async def show_admin_packages(query):
                 f"- #{r['id']} | {r['full_name']} | {r['title']} | {r['used_sessions']}/{r['total_sessions']}"
             )
         text = "\n".join(lines)
-
     await query.message.edit_text(text, reply_markup=admin_menu_keyboard())
 
 
@@ -1461,13 +1373,13 @@ async def ask_broadcast_text(query):
     chat_id = query.message.chat_id
     set_user_state(chat_id, STATE_AWAITING_BROADCAST_TEXT, True)
     await query.message.edit_text(
-        "لطفاً متن پیام گروهی را ارسال کنید. (برای لغو، چیزی مانند /cancel بفرستید.)"
+        "📨 متن پیام گروهی را ارسال کنید.\nبرای لغو، /cancel بفرستید."
     )
 
 
 async def handle_broadcast_text(update: Update, text: str):
     chat_id = update.message.chat_id
-    if text.strip().startswith("/cancel"):
+    if text.strip().lower().startswith("/cancel"):
         clear_user_state(chat_id, STATE_AWAITING_BROADCAST_TEXT)
         await update.message.reply_text("ارسال پیام گروهی لغو شد.")
         return
@@ -1476,138 +1388,118 @@ async def handle_broadcast_text(update: Update, text: str):
     sent = 0
     for u in users:
         try:
-            await update.get_bot().send_message(
-                chat_id=u["chat_id"],
-                text=text,
-            )
-            sent += 1
+            if u["chat_id"] != 0:
+                await update.get_bot().send_message(chat_id=u["chat_id"], text=text)
+                sent += 1
         except Exception as e:
             logger.exception("خطا در ارسال پیام گروهی: %s", e)
 
     clear_user_state(chat_id, STATE_AWAITING_BROADCAST_TEXT)
-    await update.message.reply_text(
-        f"پیام گروهی ارسال شد. تعداد دریافت‌کنندگان: {sent}"
-    )
+    await update.message.reply_text(f"پیام گروهی ارسال شد. تعداد دریافت‌کنندگان: {sent}")
 
 
-# ==================== Feature: Reminder & Recall Jobs ====================
+# ======================= JobQueue (یادآوری + Recall) =======================
+
 
 async def reminder_job(context: CallbackContext):
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-
-        now = datetime.now()
-        soon = now + timedelta(hours=24)
-        c.execute(
-            """
-            SELECT a.*, u.chat_id
-            FROM appointments a
-            LEFT JOIN users u ON a.user_id = u.id
-            WHERE a.status = 'reserved'
-              AND datetime(a.date || ' ' || a.time) BETWEEN ? AND ?
-            """,
-            (now.strftime("%Y-%m-%d %H:%M"), soon.strftime("%Y-%m-%d %H:%M")),
-        )
-        rows = c.fetchall()
-        conn.close()
-
-        for r in rows:
+    now = datetime.now()
+    soon = now + timedelta(hours=24)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT a.*, u.chat_id
+        FROM appointments a
+        LEFT JOIN users u ON a.user_id = u.id
+        WHERE a.status='reserved'
+          AND datetime(a.date || ' ' || a.time) BETWEEN ? AND ?
+        """,
+        (now.strftime("%Y-%m-%d %H:%M"), soon.strftime("%Y-%m-%d %H:%M")),
+    )
+    rows = c.fetchall()
+    conn.close()
+    for r in rows:
+        try:
             msg = (
                 "⏰ یادآوری نوبت:\n\n"
                 f"خدمت: {r['service_name']}\n"
                 f"تاریخ: {r['date']}\n"
                 f"ساعت: {r['time']}\n"
-                "لطفاً در صورت نیاز به لغو/تغییر، با کلینیک تماس بگیرید."
+                "در صورت نیاز به تغییر، لطفاً با کلینیک تماس بگیرید."
             )
-            try:
-                await context.bot.send_message(chat_id=r["chat_id"], text=msg)
-            except Exception as e:
-                logger.exception("خطا در ارسال یادآوری: %s", e)
-
-    except Exception as e:
-        logger.exception("خطای کلی در reminder_job: %s", e)
+            await context.bot.send_message(chat_id=r["chat_id"], text=msg)
+        except Exception as e:
+            logger.exception("خطا در reminder_job: %s", e)
 
 
 async def recall_job(context: CallbackContext):
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        today = datetime.now().date().strftime("%Y-%m-%d")
-        c.execute(
-            """
-            SELECT a.*, u.chat_id
-            FROM appointments a
-            LEFT JOIN users u ON a.user_id = u.id
-            WHERE a.recall_date = ?
-              AND a.recall_sent = 0
-            """,
-            (today,),
-        )
-        rows = c.fetchall()
-        conn.close()
-
-        for a in rows:
-            try:
-                msg = (
-                    "🔄 یادآوری دوره درمان:\n\n"
-                    f"خدمت: {a['service_name']}\n"
-                    f"تاریخ آخرین نوبت: {a['date']}\n\n"
-                    "زمان مناسبی برای تمدید یا ادامه جلسات شماست.\n"
-                    "در صورت تمایل، می‌توانیم برای تمدید نوبت جدید تنظیم کنیم. 🌿"
-                )
-                await context.bot.send_message(chat_id=a["chat_id"], text=msg)
-
-                conn2 = get_conn()
-                conn2.execute(
-                    "UPDATE appointments SET recall_sent = 1 WHERE id = ?",
-                    (a["id"],),
-                )
-                conn2.commit()
-                conn2.close()
-            except Exception as e:
-                logger.exception("recall error: %s", e)
-    except Exception as e:
-        logger.exception("خطای کلی در recall_job: %s", e)
+    today = datetime.now().date().strftime("%Y-%m-%d")
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT a.*, u.chat_id
+        FROM appointments a
+        LEFT JOIN users u ON a.user_id = u.id
+        WHERE a.recall_date = ? AND a.recall_sent = 0
+        """,
+        (today,),
+    )
+    rows = c.fetchall()
+    for r in rows:
+        try:
+            msg = (
+                "🔄 یادآوری دوره درمان:\n\n"
+                f"خدمت: {r['service_name']}\n"
+                f"تاریخ آخرین جلسه: {r['date']}\n\n"
+                "زمان مناسبی برای تمدید یا ادامه دوره‌ی شماست.\n"
+                "در صورت تمایل، می‌توانیم نوبت جدید تنظیم کنیم 🌿"
+            )
+            await context.bot.send_message(chat_id=r["chat_id"], text=msg)
+            c2 = conn.cursor()
+            c2.execute(
+                "UPDATE appointments SET recall_sent = 1 WHERE id = ?", (r["id"],)
+            )
+            conn.commit()
+        except Exception as e:
+            logger.exception("خطا در recall_job: %s", e)
+    conn.close()
 
 
-# ==================== main (Webhook + Polling Fallback) ====================
+# ======================= main (Webhook + Polling) =======================
+
 
 def main():
-    # راه‌اندازی دیتابیس
     init_db()
 
-    # ساخت اپلیکیشن تلگرام با توکن ربات
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # ثبت هندلرهای اصلی
+    # فرمان‌ها
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("adminlogin", admin_login_cmd))
+
+    # کال‌بک‌ها
     application.add_handler(CallbackQueryHandler(callback_router))
+
+    # پیام‌ها
     application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # JobQueue برای ریمایندر و Recall
-    job_queue = application.job_queue
-    if job_queue is not None:
-        job_queue.run_repeating(reminder_job, interval=600, first=60)
-        job_queue.run_repeating(recall_job, interval=3600, first=300)
-    else:
-        logger.warning(
-            'JobQueue در دسترس نیست. پکیج را با "python-telegram-bot[ext]" نصب کنید.'
-        )
+    # JobQueue
+    jq: JobQueue = application.job_queue
+    jq.run_repeating(reminder_job, interval=600, first=60)  # هر ۱۰ دقیقه چک ۲۴ ساعت بعد
+    jq.run_repeating(recall_job, interval=3600, first=300)  # هر ۱ ساعت چک Recall
 
-    # اگر WEBHOOK_URL در env تنظیم شده بود → از webhook و پورت استفاده کن
     webhook_url_base = os.getenv("WEBHOOK_URL", "").strip()
-    port_str = os.getenv("PORT", "8000")
+    port_str = os.getenv("PORT", "10000")
     try:
         port = int(port_str)
     except ValueError:
-        port = 8000
+        port = 10000
 
     if webhook_url_base:
-        # نمونه: WEBHOOK_URL = https://your-service.onrender.com
         full_webhook_url = webhook_url_base.rstrip("/") + "/" + WEBHOOK_PATH
         logger.info(
             "Starting PRO Bot in WEBHOOK mode on port %s, webhook: %s",
@@ -1621,9 +1513,7 @@ def main():
             webhook_url=full_webhook_url,
         )
     else:
-        logger.warning(
-            "WEBHOOK_URL تنظیم نشده است. ربات در حالت polling اجرا می‌شود."
-        )
+        logger.warning("WEBHOOK_URL تنظیم نشده است. ربات در حالت polling اجرا می‌شود.")
         logger.info("PRO Bot started in POLLING mode...")
         application.run_polling()
 
