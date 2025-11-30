@@ -42,7 +42,7 @@ from telegram.ext import (
 CLINIC_NAME = "Gloria Clinic"
 
 # ⚠️ اینجا توکن واقعی ربات را از BotFather قرار بده
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = "8437924316:AAFysR4_YGYr2HxhxLHWUVAJJdNHSXxNXns"
 
 
 # کارت برای پرداخت آفلاین
