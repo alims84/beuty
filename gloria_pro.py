@@ -2,21 +2,14 @@
 """
 Gloria Clinic Bot - PRO (Full)
 
-- چند شعبه (کلینیک)
-- رزرو نوبت + یادآوری قبل از نوبت + Recall دوره‌ای
-- مشاوره پوستی هوشمند (روتین صبح/شب بر اساس نوع پوست/مشکل/حساسیت)
-- پرداخت:
-    • آفلاین (کارت به کارت)
-    • آنلاین (درگاه ایرانی زرین‌پال - سندباکس / تست)
-- CRM:
-    • پرونده الکترونیک بیمار (حساسیت‌ها، یادداشت مهم، سوابق مشاوره و نوبت)
-    • امتیاز معرف (Referral)
-    • پکیج‌های درمانی
-    • پنل مدیریت با داشبورد، لیست کاربران/نوبت‌ها/پرداخت‌ها/مشاوره‌ها/پکیج‌ها، پیام گروهی
-
-برای اجرا روی Render:
-- اگر WEBHOOK_URL ست شده باشد → وبهوک روی همان URL + PORT
-- اگر WEBHOOK_URL ست نباشد → حالت polling (مناسب لوکال)
+نسخه کامل با:
+- پنل ادمین + CRM
+- رزرو نوبت + یادآوری + Recall
+- مشاوره پوستی هوشمند (روتین صبح/شب)
+- پرداخت آفلاین (کارت به کارت)
+- پرداخت آنلاین (زرین‌پال - حالت سندباکس/تستی)
+- منوی شیشه‌ای پایین (ReplyKeyboard) + منوهای Inline
+- سازگار با Render (Webhook) و لوکال (Polling)
 """
 
 import logging
@@ -33,7 +26,6 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -53,7 +45,7 @@ CLINIC_NAME = "Gloria Clinic"
 DEFAULT_BOT_TOKEN = "8437924316:AAFysR4_YGYr2HxhxLHWUVAJJdNHSXxNXns"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN تنظیم نشده است و مقدار پیش‌فرض هم خالی است.")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN تنظیم نشده است.")
 
 WEBHOOK_PATH = f"webhook/{TELEGRAM_BOT_TOKEN.split(':')[0]}"
 
@@ -68,7 +60,12 @@ ADMIN_LOGIN_USERNAME = "admin"
 ADMIN_LOGIN_PASSWORD = "12345"
 
 # زرین‌پال (سندباکس)
-ZARINPAL_MERCHANT_ID = os.getenv("ZARINPAL_MERCHANT_ID", "").strip()
+# مرچنت تستی تو:
+DEFAULT_ZARINPAL_MERCHANT_ID = "120c505c-81e1-41e2-8138-63b819e324ae"
+ZARINPAL_MERCHANT_ID = os.getenv(
+    "ZARINPAL_MERCHANT_ID", DEFAULT_ZARINPAL_MERCHANT_ID
+).strip()
+
 ZARINPAL_SANDBOX = True
 ZARINPAL_REQUEST_URL = (
     "https://sandbox.zarinpal.com/pg/rest/WebGate/PaymentRequest.json"
@@ -100,10 +97,6 @@ STATE_AWAITING_ALLERGIES = "awaiting_allergies"
 STATE_AWAITING_IMPORTANT_NOTES = "awaiting_important_notes"
 
 STATE_AWAITING_REFERRAL_CODE = "awaiting_referral_code"
-
-STATE_AWAITING_SKIN_TYPE = "awaiting_skin_type"
-STATE_AWAITING_SKIN_CONCERN = "awaiting_skin_concern"
-STATE_AWAITING_SENSITIVITY = "awaiting_sensitivity"
 
 STATE_AWAITING_BROADCAST_TEXT = "awaiting_broadcast_text"
 
@@ -172,7 +165,6 @@ TREATMENT_SUGGESTIONS = {
         ],
         "notes": "شست‌وشوی بیش از حد و آب داغ را محدود کنید و حتماً بعد شست‌وشو تا چند دقیقه کرم بزنید.",
     },
-    # می‌توانی در آینده بقیه ترکیب‌ها را هم اضافه کنی
 }
 
 # مراقبت بعد درمان
@@ -393,11 +385,10 @@ def get_user_state(chat_id: int, key: str, default: Any = None):
     user_id = row["id"]
     c.execute("SELECT state_json FROM user_states WHERE user_id = ?", (user_id,))
     sr = c.fetchone()
+    conn.close()
     if not sr or not sr["state_json"]:
-        conn.close()
         return default
     data = json.loads(sr["state_json"])
-    conn.close()
     return data.get(key, default)
 
 
@@ -440,7 +431,18 @@ def get_all_users() -> List[sqlite3.Row]:
 # ======================= کیبوردها =======================
 
 
-def main_menu_keyboard(is_admin_user: bool) -> InlineKeyboardMarkup:
+def build_reply_keyboard(is_admin_user: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("🗓 رزرو نوبت"), KeyboardButton("💳 پرداخت")],
+        [KeyboardButton("🧴 مشاوره پوستی"), KeyboardButton("👤 پروفایل من")],
+        [KeyboardButton("📣 لینک من / کد معرف")],
+    ]
+    if is_admin_user:
+        rows.append([KeyboardButton("🛠 پنل مدیریت")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def main_menu_inline(is_admin_user: bool) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("🗓 رزرو نوبت", callback_data="menu_reserve")],
         [InlineKeyboardButton("💳 پرداخت", callback_data="menu_payment")],
@@ -627,13 +629,12 @@ def build_skin_consultation_text(
 def create_zarinpal_payment_link(amount: int, description: str) -> Optional[str]:
     """
     درخواست لینک پرداخت از زرین‌پال (حالت سندباکس).
-    این تابع فقط لینک را برمی‌گرداند؛ تأیید نهایی پرداخت اینجا انجام نمی‌شود.
     """
     if not ZARINPAL_MERCHANT_ID:
         logger.warning("ZARINPAL_MERCHANT_ID تنظیم نشده است.")
         return None
 
-    callback_url = "https://example.com/payment/callback"  # در صورت نیاز بعداً می‌تونیم واقعی کنیم
+    callback_url = "https://example.com/payment/callback"
 
     payload = {
         "MerchantID": ZARINPAL_MERCHANT_ID,
@@ -647,13 +648,13 @@ def create_zarinpal_payment_link(amount: int, description: str) -> Optional[str]
         r = requests.post(ZARINPAL_REQUEST_URL, json=payload, timeout=10)
         r.raise_for_status()
         data = r.json()
-        # ساختار سندباکس قدیمی:
-        # { 'Status': 100, 'Authority': 'XXXXXXXXXX' }
         authority = None
         status = None
         if isinstance(data, dict):
             status = data.get("Status") or data.get("status")
-            authority = data.get("Authority") or (data.get("data") or {}).get("authority")
+            authority = data.get("Authority") or (data.get("data") or {}).get(
+                "authority"
+            )
         if status == 100 and authority:
             return ZARINPAL_STARTPAY_URL.format(Authority=authority)
         logger.warning("Zarinpal response not success: %s", data)
@@ -670,15 +671,27 @@ async def start(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     user = update.effective_user
     full_name = user.full_name
+
+    # همه stateها را پاک می‌کنیم تا گیر نکند
+    clear_user_state(chat_id, None)
+
     db_user = get_or_create_user(chat_id, full_name)
 
-    text = (
+    welcome = (
         f"سلام {full_name} 🌸\n"
         f"به ربات {CLINIC_NAME} (نسخه PRO) خوش آمدید.\n\n"
-        "از منوی زیر گزینه‌ی مورد نظر را انتخاب کنید."
+        "از منوی پایین یا منوی شیشه‌ای زیر استفاده کنید."
     )
+
     await update.message.reply_text(
-        text, reply_markup=main_menu_keyboard(is_admin(chat_id))
+        welcome,
+        reply_markup=build_reply_keyboard(is_admin(chat_id)),
+    )
+
+    # یک منوی Inline هم برای راحتی
+    await update.message.reply_text(
+        "منوی اصلی:",
+        reply_markup=main_menu_inline(is_admin(chat_id)),
     )
 
 
@@ -694,7 +707,10 @@ async def help_command(update: Update, context: CallbackContext):
 async def admin_login_cmd(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     set_user_state(chat_id, STATE_AWAITING_ADMIN_USERNAME, True)
-    await update.message.reply_text("🔐 لطفاً نام کاربری ادمین را وارد کنید:")
+    await update.message.reply_text(
+        "🔐 لطفاً نام کاربری ادمین را وارد کنید:",
+        reply_markup=build_reply_keyboard(is_admin(chat_id)),
+    )
 
 
 # ======================= مسیج هندلرها =======================
@@ -702,10 +718,12 @@ async def admin_login_cmd(update: Update, context: CallbackContext):
 
 async def handle_text(update: Update, context: CallbackContext):
     message = update.message
-    text = message.text.strip()
+    text = (message.text or "").strip()
     chat_id = message.chat_id
+    user_row = get_or_create_user(chat_id, message.from_user.full_name)
 
-    # ادمین لاگین
+    # --- اول stateهای خاص (لاگین ادمین، آلرژی، ...) ---
+
     if get_user_state(chat_id, STATE_AWAITING_ADMIN_USERNAME):
         clear_user_state(chat_id, STATE_AWAITING_ADMIN_USERNAME)
         set_user_state(chat_id, STATE_AWAITING_ADMIN_PASSWORD, text)
@@ -724,14 +742,13 @@ async def handle_text(update: Update, context: CallbackContext):
             conn.close()
             await message.reply_text(
                 "✅ ورود موفق به پنل مدیریت.\n"
-                "از منوی اصلی دکمه «🛠 پنل مدیریت» را خواهید دید.",
-                reply_markup=main_menu_keyboard(True),
+                "از منوی پایین می‌توانید «🛠 پنل مدیریت» را انتخاب کنید.",
+                reply_markup=build_reply_keyboard(True),
             )
         else:
             await message.reply_text("❌ نام کاربری یا رمز عبور اشتباه است.")
         return
 
-    # ثبت آلرژی
     if get_user_state(chat_id, STATE_AWAITING_ALLERGIES):
         clear_user_state(chat_id, STATE_AWAITING_ALLERGIES)
         conn = get_conn()
@@ -740,10 +757,12 @@ async def handle_text(update: Update, context: CallbackContext):
         )
         conn.commit()
         conn.close()
-        await message.reply_text("✅ حساسیت‌ها/آلرژی‌ها ذخیره شد.")
+        await message.reply_text(
+            "✅ حساسیت‌ها/آلرژی‌ها ذخیره شد.",
+            reply_markup=build_reply_keyboard(is_admin(chat_id)),
+        )
         return
 
-    # یادداشت مهم
     if get_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES):
         clear_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES)
         conn = get_conn()
@@ -753,20 +772,56 @@ async def handle_text(update: Update, context: CallbackContext):
         )
         conn.commit()
         conn.close()
-        await message.reply_text("✅ یادداشت در پرونده شما ذخیره شد.")
+        await message.reply_text(
+            "✅ یادداشت در پرونده شما ذخیره شد.",
+            reply_markup=build_reply_keyboard(is_admin(chat_id)),
+        )
         return
 
-    # کد معرف
     if get_user_state(chat_id, STATE_AWAITING_REFERRAL_CODE):
         await save_referral_from_text(update, text)
         return
 
-    # پیام گروهی
     if get_user_state(chat_id, STATE_AWAITING_BROADCAST_TEXT) and is_admin(chat_id):
         await handle_broadcast_text(update, text)
         return
 
-    await message.reply_text("پیام شما دریافت شد. برای استفاده از امکانات، از منو استفاده کنید.")
+    # --- منوی پایین (ReplyKeyboard) ---
+
+    if text == "🗓 رزرو نوبت":
+        await message.reply_text(
+            "🗓 رزرو نوبت:\n\nابتدا شعبه/کلینیک را انتخاب کنید.",
+            reply_markup=clinics_keyboard(),
+        )
+        return
+
+    if text == "💳 پرداخت":
+        await show_payment_menu_message(message, user_row)
+        return
+
+    if text == "🧴 مشاوره پوستی":
+        await message.reply_text(
+            "ابتدا نوع پوست خود را انتخاب کنید:", reply_markup=skin_type_keyboard()
+        )
+        return
+
+    if text == "👤 پروفایل من":
+        await show_profile_message(message, user_row)
+        return
+
+    if text == "📣 لینک من / کد معرف":
+        await show_referral_menu_message(message, user_row)
+        return
+
+    if text == "🛠 پنل مدیریت" and is_admin(chat_id):
+        await message.reply_text("🛠 پنل مدیریت:", reply_markup=admin_menu_keyboard())
+        return
+
+    # --- حالت پیش‌فرض ---
+    await message.reply_text(
+        "پیام شما دریافت شد. برای استفاده از امکانات، از منو استفاده کنید.",
+        reply_markup=build_reply_keyboard(is_admin(chat_id)),
+    )
 
 
 async def handle_contact(update: Update, context: CallbackContext):
@@ -788,7 +843,8 @@ async def handle_photo(update: Update, context: CallbackContext):
         clear_user_state(chat_id, STATE_AWAITING_RECEIPT_PHOTO)
         await update.message.reply_text(
             "✅ تصویر رسید دریافت شد.\n"
-            "پس از بررسی ادمین، وضعیت پرداخت در سیستم به‌روزرسانی می‌شود."
+            "پس از بررسی ادمین، وضعیت پرداخت در سیستم به‌روزرسانی می‌شود.",
+            reply_markup=build_reply_keyboard(is_admin(chat_id)),
         )
     else:
         await update.message.reply_text("عکس شما دریافت شد.")
@@ -806,17 +862,23 @@ async def callback_router(update: Update, context: CallbackContext):
 
     # منوی اصلی
     if data == "menu_reserve":
-        await show_reserve_menu(query, user_row)
+        await query.message.edit_text(
+            "🗓 رزرو نوبت:\n\nابتدا شعبه/کلینیک را انتخاب کنید.",
+            reply_markup=clinics_keyboard(),
+        )
     elif data == "menu_payment":
-        await show_payment_menu(query, user_row)
+        await show_payment_menu_query(query, user_row)
     elif data == "menu_consult":
         await start_skin_consult(query)
     elif data == "menu_packages":
-        await show_packages_menu(query, user_row)
+        await query.message.edit_text(
+            "📦 مدیریت پکیج‌ها در نسخه بعدی تکمیل‌تر خواهد شد.",
+            reply_markup=main_menu_inline(is_admin(chat_id)),
+        )
     elif data == "menu_profile":
-        await show_profile(query, user_row)
+        await show_profile_query(query, user_row)
     elif data == "menu_referral":
-        await show_referral_menu(query, user_row)
+        await show_referral_menu_query(query, user_row)
     elif data == "menu_admin":
         if is_admin(chat_id):
             await show_admin_menu(query)
@@ -841,16 +903,16 @@ async def callback_router(update: Update, context: CallbackContext):
 
     elif data == "back_to_main":
         await query.message.edit_text(
-            "بازگشت به منوی اصلی:",
-            reply_markup=main_menu_keyboard(is_admin(chat_id)),
+            "منوی اصلی:",
+            reply_markup=main_menu_inline(is_admin(chat_id)),
         )
         return
 
     # پرداخت
     elif data == "payment_offline":
-        await show_offline_payment(query, user_row)
+        await show_offline_payment_query(query, user_row)
     elif data == "payment_online":
-        await show_online_payment(query, user_row)
+        await show_online_payment_query(query, user_row)
 
     # مشاوره پوستی
     elif data.startswith("skin_type_"):
@@ -892,23 +954,22 @@ async def callback_router(update: Update, context: CallbackContext):
 # ======================= رزرو نوبت =======================
 
 
-async def show_reserve_menu(query, user_row):
-    text = "🗓 رزرو نوبت:\n\nابتدا شعبه/کلینیک را انتخاب کنید."
-    await query.message.edit_text(text, reply_markup=clinics_keyboard())
-
-
 async def handle_clinic_select(query, data: str, user_row):
     clinic_id = int(data.split("_")[1])
     chat_id = query.message.chat_id
     set_user_state(chat_id, "selected_clinic_id", clinic_id)
-    await query.message.edit_text("نوع خدمت را انتخاب کنید:", reply_markup=services_keyboard())
+    await query.message.edit_text(
+        "نوع خدمت را انتخاب کنید:", reply_markup=services_keyboard()
+    )
 
 
 async def handle_service_select(query, data: str, user_row):
     service_code = data.split("_", 1)[1]  # Botox/Filler/...
     chat_id = query.message.chat_id
     set_user_state(chat_id, "selected_service_code", service_code)
-    await query.message.edit_text("تاریخ مراجعه را انتخاب کنید:", reply_markup=date_keyboard())
+    await query.message.edit_text(
+        "تاریخ مراجعه را انتخاب کنید:", reply_markup=date_keyboard()
+    )
 
 
 async def handle_date_select(query, data: str, user_row):
@@ -928,7 +989,10 @@ async def handle_time_select(query, data: str, user_row):
     clinic_id = get_user_state(chat_id, "selected_clinic_id")
     service_code = get_user_state(chat_id, "selected_service_code")
     if not clinic_id or not service_code:
-        await query.message.edit_text("❌ اطلاعات نوبت کامل نیست. لطفاً از اول رزرو را شروع کنید.")
+        await query.message.edit_text(
+            "❌ اطلاعات نوبت کامل نیست. لطفاً از اول رزرو را شروع کنید.",
+            reply_markup=main_menu_inline(is_admin(chat_id)),
+        )
         return
 
     service_name_map = {
@@ -939,7 +1003,6 @@ async def handle_time_select(query, data: str, user_row):
     }
     service_name = service_name_map.get(service_code, service_code)
 
-    # تعیین تاریخ Recall
     recall_days = TREATMENT_RECALL_DAYS.get(service_code, 0)
     recall_date = None
     if recall_days > 0:
@@ -979,58 +1042,102 @@ async def handle_time_select(query, data: str, user_row):
         text += f"\n📅 زمان مناسب برای یادآوری جلسه بعدی: {recall_date}"
 
     await query.message.edit_text(
-        text, reply_markup=main_menu_keyboard(is_admin(chat_id))
+        text, reply_markup=main_menu_inline(is_admin(chat_id))
     )
 
 
 # ======================= پرداخت =======================
 
 
-async def show_payment_menu(query, user_row):
+async def show_payment_menu_message(message, user_row):
+    chat_id = message.chat_id
     text = (
         "💳 پرداخت خدمات:\n\n"
-        "می‌توانید پرداخت خود را به‌صورت آفلاین (کارت به کارت) یا از طریق درگاه ایرانی (حالت تستی) انجام دهید."
+        "می‌توانید پرداخت خود را به‌صورت آفلاین (کارت به کارت) یا از طریق درگاه ایرانی (زرین‌پال - تست) انجام دهید."
     )
     buttons = [
-        [InlineKeyboardButton("پرداخت آفلاین (کارت به کارت)", callback_data="payment_offline")],
-        [InlineKeyboardButton("پرداخت آنلاین (درگاه ایرانی - تست)", callback_data="payment_online")],
+        [
+            InlineKeyboardButton(
+                "🏦 پرداخت آفلاین (کارت به کارت)", callback_data="payment_offline"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 پرداخت آنلاین (درگاه ایرانی - تست)", callback_data="payment_online"
+            )
+        ],
         [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
     ]
-    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await message.reply_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 
-async def show_offline_payment(query, user_row):
+async def show_payment_menu_query(query, user_row):
+    text = (
+        "💳 پرداخت خدمات:\n\n"
+        "می‌توانید پرداخت خود را به‌صورت آفلاین (کارت به کارت) یا از طریق درگاه ایرانی (زرین‌پال - تست) انجام دهید."
+    )
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "🏦 پرداخت آفلاین (کارت به کارت)", callback_data="payment_offline"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 پرداخت آنلاین (درگاه ایرانی - تست)", callback_data="payment_online"
+            )
+        ],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
+    ]
+    await query.message.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def show_offline_payment_query(query, user_row):
     chat_id = query.message.chat_id
     set_user_state(chat_id, STATE_AWAITING_RECEIPT_PHOTO, True)
     text = (
-        "💳 پرداخت آفلاین (کارت به کارت):\n\n"
+        "🏦 پرداخت آفلاین (کارت به کارت):\n\n"
         f"شماره کارت:\n{OFFLINE_CARD_NUMBER}\n"
         f"به نام: {OFFLINE_CARD_OWNER}\n\n"
-        "پس از واریز، تصویر رسید را برای ربات ارسال کنید."
+        "پس از واریز، تصویر رسید را برای ربات ارسال کنید.\n\n"
+        "برای بازگشت می‌توانید /start یا منوی پایین را استفاده کنید."
     )
-    await query.message.edit_text(text)
+    await query.message.edit_text(
+        text, reply_markup=main_menu_inline(is_admin(chat_id))
+    )
 
 
-async def show_online_payment(query, user_row):
+async def show_online_payment_query(query, user_row):
     chat_id = query.message.chat_id
     amount = 500000  # مثال: ۵۰ هزار تومان = ۵۰۰۰۰۰ ریال
     description = f"پرداخت خدمات {CLINIC_NAME}"
 
     link = create_zarinpal_payment_link(amount, description)
     if not link:
+        text = (
+            "❌ در حال حاضر امکان اتصال کامل به درگاه پرداخت فراهم نیست.\n"
+            "می‌توانید از روش کارت به کارت استفاده کنید.\n\n"
+            "برای بازگشت از منوی پایین یا /start استفاده کنید."
+        )
         await query.message.edit_text(
-            "❌ در حال حاضر امکان اتصال به درگاه پرداخت فراهم نیست.\n"
-            "می‌توانید از روش کارت به کارت استفاده کنید."
+            text, reply_markup=main_menu_inline(is_admin(chat_id))
         )
         return
 
     text = (
-        "💳 پرداخت آنلاین (درگاه ایرانی - تست):\n\n"
+        "💳 پرداخت آنلاین (زرین‌پال - تست):\n\n"
         "برای ادامه پرداخت روی لینک زیر کلیک کنید:\n"
         f"{link}\n\n"
-        "پس از تکمیل پرداخت، در این نسخه از ربات، وضعیت به‌صورت دستی توسط کلینیک بررسی می‌شود."
+        "در این نسخه‌ی تست، وضعیت پرداخت به‌صورت خودکار تایید نمی‌شود و توسط کلینیک بررسی می‌گردد.\n\n"
+        "پس از پرداخت، می‌توانید با منوی پایین به سایر بخش‌ها برگردید."
     )
-    await query.message.edit_text(text)
+    await query.message.edit_text(
+        text, reply_markup=main_menu_inline(is_admin(chat_id))
+    )
 
 
 # ======================= مشاوره پوستی =======================
@@ -1038,10 +1145,9 @@ async def show_online_payment(query, user_row):
 
 async def start_skin_consult(query):
     chat_id = query.message.chat_id
-    clear_user_state(chat_id, STATE_AWAITING_SKIN_TYPE)
-    clear_user_state(chat_id, STATE_AWAITING_SKIN_CONCERN)
-    clear_user_state(chat_id, STATE_AWAITING_SENSITIVITY)
-    await query.message.edit_text("ابتدا نوع پوست خود را انتخاب کنید:", reply_markup=skin_type_keyboard())
+    await query.message.edit_text(
+        "ابتدا نوع پوست خود را انتخاب کنید:", reply_markup=skin_type_keyboard()
+    )
 
 
 async def handle_skin_type_select(query, data: str, user_row):
@@ -1055,7 +1161,7 @@ async def handle_skin_type_select(query, data: str, user_row):
 
 async def handle_skin_concern_select(query, data: str, user_row):
     chat_id = query.message.chat_id
-    concern_key = data.split("_", 1)[1]  # acne/...
+    concern_key = data.split("_", 1)[1]
     set_user_state(chat_id, "skin_concern_key", concern_key)
     await query.message.edit_text(
         "میزان حساسیت پوست خود را مشخص کنید:", reply_markup=sensitivity_keyboard()
@@ -1064,12 +1170,15 @@ async def handle_skin_concern_select(query, data: str, user_row):
 
 async def handle_sensitivity_select(query, data: str, user_row):
     chat_id = query.message.chat_id
-    sens_key = data.split("_", 1)[1].replace("sens_", "")
+    sens_key = data.replace("sens_", "")
 
     skin_type_key = get_user_state(chat_id, "skin_type_key")
     skin_concern_key = get_user_state(chat_id, "skin_concern_key")
     if not skin_type_key or not skin_concern_key:
-        await query.message.edit_text("❌ اطلاعات مشاوره کامل نیست. لطفاً از ابتدا شروع کنید.")
+        await query.message.edit_text(
+            "❌ اطلاعات مشاوره کامل نیست. لطفاً از ابتدا شروع کنید.",
+            reply_markup=main_menu_inline(is_admin(chat_id)),
+        )
         return
 
     consult = build_skin_consultation_text(skin_type_key, skin_concern_key, sens_key)
@@ -1096,7 +1205,7 @@ async def handle_sensitivity_select(query, data: str, user_row):
 
     await query.message.edit_text(
         f"📋 {consult['title']}\n\n{consult['body']}",
-        reply_markup=main_menu_keyboard(is_admin(chat_id)),
+        reply_markup=main_menu_inline(is_admin(chat_id)),
     )
 
 
@@ -1107,17 +1216,37 @@ def generate_referral_code(user_id: int) -> str:
     return f"GLR{user_id:05d}"
 
 
-async def show_profile(query, user_row):
+async def show_profile_query(query, user_row):
     chat_id = query.message.chat_id
     text = format_user_profile(user_row)
     buttons = [
         [
             InlineKeyboardButton("حساسیت‌ها / آلرژی‌ها", callback_data="enter_allergies"),
-            InlineKeyboardButton("یادداشت مهم", callback_data="enter_important_notes"),
+            InlineKeyboardButton(
+                "یادداشت مهم", callback_data="enter_important_notes"
+            ),
         ],
         [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
     ]
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def show_profile_message(message, user_row):
+    chat_id = message.chat_id
+    text = format_user_profile(user_row)
+    buttons = [
+        [
+            InlineKeyboardButton("حساسیت‌ها / آلرژی‌ها", callback_data="enter_allergies"),
+            InlineKeyboardButton(
+                "یادداشت مهم", callback_data="enter_important_notes"
+            ),
+        ],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
+    ]
+    await message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def ask_allergies(query):
@@ -1129,11 +1258,23 @@ async def ask_allergies(query):
 async def ask_important_notes(query):
     chat_id = query.message.chat_id
     set_user_state(chat_id, STATE_AWAITING_IMPORTANT_NOTES, True)
-    await query.message.edit_text("یادداشت‌های مهم درباره‌ی وضعیت پوستی یا پزشکی خود را وارد کنید:")
+    await query.message.edit_text(
+        "یادداشت‌های مهم درباره‌ی وضعیت پوستی یا پزشکی خود را وارد کنید:"
+    )
 
 
-async def show_referral_menu(query, user_row):
+async def show_referral_menu_query(query, user_row):
     chat_id = query.message.chat_id
+    text, buttons = build_referral_menu(user_row)
+    await query.message.edit_text(text, reply_markup=buttons)
+
+
+async def show_referral_menu_message(message, user_row):
+    text, buttons = build_referral_menu(user_row)
+    await message.reply_text(text, reply_markup=buttons)
+
+
+def build_referral_menu(user_row):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
@@ -1163,17 +1304,21 @@ async def show_referral_menu(query, user_row):
         f"لینک دعوت (نمونه):\n{referral_link}\n\n"
         "با اشتراک این لینک، در صورت ثبت‌نام دوستانتان، امتیاز دریافت می‌کنید."
     )
-    buttons = [
-        [InlineKeyboardButton("ثبت کد معرف دیگران", callback_data="enter_referral")],
-        [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
-    ]
-    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    buttons = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("ثبت کد معرف دوست", callback_data="enter_referral")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
+        ]
+    )
+    return text, buttons
 
 
 async def ask_referral_code(query, user_row):
     chat_id = query.message.chat_id
     set_user_state(chat_id, STATE_AWAITING_REFERRAL_CODE, True)
-    await query.message.edit_text("کد معرف دوست خود را وارد کنید (مثلاً GLR00012):")
+    await query.message.edit_text(
+        "لطفاً کد معرف دوست خود را ارسال کنید (مثلاً: GLR00012):"
+    )
 
 
 async def save_referral_from_text(update: Update, text: str):
@@ -1218,11 +1363,14 @@ async def save_referral_from_text(update: Update, text: str):
     conn.commit()
     conn.close()
     clear_user_state(chat_id, STATE_AWAITING_REFERRAL_CODE)
-    await update.message.reply_text("✅ کد معرف با موفقیت ثبت شد.")
+    await update.message.reply_text(
+        "✅ کد معرف با موفقیت ثبت شد.",
+        reply_markup=build_reply_keyboard(is_admin(chat_id)),
+    )
 
 
 async def show_my_referral_link(query, user_row):
-    await show_referral_menu(query, user_row)
+    await show_referral_menu_query(query, user_row)
 
 
 # ======================= Admin Panel =======================
