@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Gloria Clinic Telegram Bot - PRO Version
+Gloria Clinic Telegram Bot - PRO Version (Webhook-ready for Render)
 
 ویژگی‌ها:
 - چند شعبه (کلینیک)
 - رزرو نوبت + یادآوری قبل نوبت + پیام مراقبت بعد درمان + امتیازدهی + Recall
-- پرداخت آفلاین (کارت به کارت) + پرداخت آنلاین (در حالت pending برای تأیید توسط ادمین)
+- پرداخت آفلاین (کارت به کارت) + پرداخت نمایشی آنلاین
 - مشاوره پوستی هوشمند (جواب اختصاصی بر اساس نوع پوست/مشکل/حساسیت)
 - پرونده الکترونیک زیبایی (سوابق نوبت، مشاوره، حساسیت، یادداشت‌های CRM)
-- پکیج درمانی (مثلاً ۳ جلسه جوانسازی، ۶ جلسه لیزر، با شمارش جلسات استفاده‌شده)
+- پکیج درمانی
 - کد معرف / لینک من (Referral) + امتیاز معرف
 - پنل مدیریت با داشبورد، لیست کاربران، نوبت‌ها، پرداخت‌ها، مشاوره‌ها، پکیج‌ها و پیام گروهی
+- آماده‌ی اجرا روی Render به صورت Web Service:
+  * اگر WEBHOOK_URL در env باشد → webhook + پورت
+  * اگر WEBHOOK_URL نباشد → run_polling (برای لوکال)
 """
 
 import logging
@@ -34,16 +37,25 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
-    filters,
     JobQueue,
+    filters,
 )
 
 # ==================== تنظیمات کلی ====================
 
 CLINIC_NAME = "Gloria Clinic"
 
-# ⚠️ اگر خواستی توکن را عوض کنی، فقط همین خط را عوض کن:
-TELEGRAM_BOT_TOKEN = "8437924316:AAFysR4_YGYr2HxhxLHWUVAJJdNHSXxNXns"
+# ⚠️ اگر خواستی توکن را عوض کنی، فقط همین مقدار را عوض کن
+DEFAULT_BOT_TOKEN = "8437924316:AAFysR4_YGYr2HxhxLHWUVAJJdNHSXxNXns"
+
+# اگر در env مقدار TELEGRAM_BOT_TOKEN بود، از آن استفاده می‌کنیم؛
+# وگرنه از مقدار پیش‌فرض بالا
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN تنظیم نشده است و توکن پیش‌فرض هم خالی است.")
+
+# مسیر وبهوک (فقط بخش path، بدون دامین)
+WEBHOOK_PATH = f"webhook/{TELEGRAM_BOT_TOKEN.split(':')[0]}"
 
 DB_PATH = "clinic_pro.db"
 
@@ -55,7 +67,7 @@ OFFLINE_CARD_OWNER = "Gloria Clinic"
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "1234"
 
-# حداقل فاصله بین نوبت‌ها بر حسب دقیقه
+# حداقل فاصله بین نوبت‌ها بر حسب دقیقه (فعلاً فقط برای منطق آینده)
 MIN_SLOT_MINUTES = 30
 
 # برای امتیاز معرف
@@ -128,7 +140,7 @@ TREATMENT_SUGGESTIONS = {
         ],
         "notes": "مصرف آب کافی و پرهیز از شست‌وشوی بیش‌ازحد، برای این نوع پوست بسیار مهم است.",
     },
-    # می‌توانی بقیه ترکیب‌ها را هم اضافه کنی...
+    # می‌توانی بقیه ترکیب‌ها را هم در آینده اضافه کنی...
 }
 
 POST_CARE_MESSAGES = {
@@ -144,7 +156,6 @@ TREATMENT_RECALL_DAYS = {
     "Meso": {"tag": "Meso", "recall_days": 90},
 }
 
-# پکیج‌ها
 TREATMENT_PACKAGES = {
     "laser_6": {
         "title": "پکیج ۶ جلسه‌ای لیزر",
@@ -158,7 +169,6 @@ TREATMENT_PACKAGES = {
     },
 }
 
-# پزشکان
 DOCTORS: List[str] = ["دکتر احمدی", "دکتر رضایی", "دکتر محمدی"]
 
 TIME_SLOTS = ["10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00"]
@@ -187,7 +197,7 @@ STATE_AWAITING_RATING = "awaiting_rating"
 
 STATE_AWAITING_NEXT_RECALL_DATE = "awaiting_next_recall_date"
 
-# for payments
+# payment statuses
 PAYMENT_STATUS_PENDING = "pending"
 PAYMENT_STATUS_CONFIRMED = "confirmed"
 PAYMENT_STATUS_REJECTED = "rejected"
@@ -327,6 +337,16 @@ def init_db():
         """
     )
 
+    # user_states
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_states (
+            user_id INTEGER PRIMARY KEY,
+            state_json TEXT
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -369,15 +389,7 @@ def set_user_state(chat_id: int, state_key: str, value: Any):
         conn.close()
         return
     user_id = row["id"]
-    table_name = "user_states"
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_states (
-            user_id INTEGER PRIMARY KEY,
-            state_json TEXT
-        )
-        """
-    )
+
     c.execute("SELECT state_json FROM user_states WHERE user_id = ?", (user_id,))
     sr = c.fetchone()
     import json
@@ -404,14 +416,6 @@ def get_user_state(chat_id: int, state_key: str, default=None):
         conn.close()
         return default
     user_id = row["id"]
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_states (
-            user_id INTEGER PRIMARY KEY,
-            state_json TEXT
-        )
-        """
-    )
     c.execute("SELECT state_json FROM user_states WHERE user_id = ?", (user_id,))
     sr = c.fetchone()
     import json
@@ -433,14 +437,6 @@ def clear_user_state(chat_id: int, state_key: Optional[str] = None):
         conn.close()
         return
     user_id = row["id"]
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_states (
-            user_id INTEGER PRIMARY KEY,
-            state_json TEXT
-        )
-        """
-    )
     c.execute("SELECT state_json FROM user_states WHERE user_id = ?", (user_id,))
     sr = c.fetchone()
     import json
@@ -491,12 +487,9 @@ def get_user_by_chat(chat_id: int):
 def ensure_admin_user():
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "SELECT * FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1"
-    )
+    c.execute("SELECT * FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1")
     row = c.fetchone()
     if not row:
-        # اولین ادمین ایجاد می‌شود با chat_id فرضی 0
         c.execute(
             """
             INSERT INTO users (chat_id, full_name, phone_number, is_admin)
@@ -1187,13 +1180,14 @@ async def show_referral_menu(query, user_row):
         conn2.commit()
         conn2.close()
 
+    # لینک دعوت (domain/username واقعی بات را باید از BotFather و تنظیمات Render بگیری)
     referral_link = f"https://t.me/{CLINIC_NAME.replace(' ', '')}_bot?start={ref_code}"
 
     text = (
         "📣 لینک من / کد معرف:\n\n"
         f"کد معرف شما: {ref_code}\n"
         f"امتیازهای فعلی: {points}\n\n"
-        f"لینک دعوت:\n{referral_link}\n\n"
+        f"لینک دعوت (نمونه):\n{referral_link}\n\n"
         "این لینک را برای دوستان خود بفرستید؛ در صورت ثبت‌نام، امتیاز دریافت می‌کنید."
     )
     buttons = [
@@ -1262,7 +1256,6 @@ async def save_referral_code_from_text(update: Update, text: str):
 
 
 async def show_my_referral_link(query, user_row):
-    # (اگر خواستی جداگانه پیاده‌سازی کنی)
     await show_referral_menu(query, user_row)
 
 
@@ -1578,7 +1571,7 @@ async def recall_job(context: CallbackContext):
         logger.exception("خطای کلی در recall_job: %s", e)
 
 
-# ==================== main ====================
+# ==================== main (Webhook + Polling Fallback) ====================
 
 def main():
     # راه‌اندازی دیتابیس
@@ -1595,19 +1588,44 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # راه‌اندازی JobQueue برای ریمایندرها و Recall (در صورت در دسترس بودن)
+    # JobQueue برای ریمایندر و Recall
     job_queue = application.job_queue
     if job_queue is not None:
         job_queue.run_repeating(reminder_job, interval=600, first=60)
         job_queue.run_repeating(recall_job, interval=3600, first=300)
     else:
         logger.warning(
-            "JobQueue در دسترس نیست. برای فعال شدن ریمایندر نوبت‌ها، "
-            'پکیج را با "python-telegram-bot[job-queue]" نصب کنید.'
+            'JobQueue در دسترس نیست. پکیج را با "python-telegram-bot[ext]" نصب کنید.'
         )
 
-    logger.info("PRO Bot started...")
-    application.run_polling()
+    # اگر WEBHOOK_URL در env تنظیم شده بود → از webhook و پورت استفاده کن
+    webhook_url_base = os.getenv("WEBHOOK_URL", "").strip()
+    port_str = os.getenv("PORT", "8000")
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = 8000
+
+    if webhook_url_base:
+        # نمونه: WEBHOOK_URL = https://your-service.onrender.com
+        full_webhook_url = webhook_url_base.rstrip("/") + "/" + WEBHOOK_PATH
+        logger.info(
+            "Starting PRO Bot in WEBHOOK mode on port %s, webhook: %s",
+            port,
+            full_webhook_url,
+        )
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=WEBHOOK_PATH,
+            webhook_url=full_webhook_url,
+        )
+    else:
+        logger.warning(
+            "WEBHOOK_URL تنظیم نشده است. ربات در حالت polling اجرا می‌شود."
+        )
+        logger.info("PRO Bot started in POLLING mode...")
+        application.run_polling()
 
 
 if __name__ == "__main__":
@@ -1616,4 +1634,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("❕ ربات با دستور شما متوقف شد.")
     except Exception as e:
-        logger.exception("خطای کلی در اجرای ربات: %s", e)
+        logger.exception("⚠️ خطای کلی در اجرای ربات: %s", e)
