@@ -44,7 +44,6 @@ CLINIC_NAME = "Gloria Clinic"
 # ⚠️ اینجا توکن واقعی ربات را از BotFather قرار بده
 TELEGRAM_BOT_TOKEN = "8437924316:AAFysR4_YGYr2HxhxLHWUVAJJdNHSXxNXns"
 
-
 # کارت برای پرداخت آفلاین
 CARD_NUMBER = "6037-XXXX-XXXX-XXXX"
 CARD_OWNER = "نام صاحب حساب"
@@ -2307,16 +2306,15 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # JobQueue برای ریمایندرها
     job_queue = application.job_queue
-    if job_queue is not None:
-        job_queue.run_repeating(reminder_job, interval=600, first=60)
-    else:
-        logger.warning(
-            "JobQueue در دسترس نیست. برای فعال شدن ریمایندر نوبت‌ها، "
-            'پکیج را با "python-telegram-bot[job-queue]" نصب کنید.'
-        )
+    job_queue.run_repeating(reminder_job, interval=600, first=60)
 
     logger.info("PRO Bot started...")
     application.run_polling()
 
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("❕ ربات با دستور شما متوقف شد.")
