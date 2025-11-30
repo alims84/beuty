@@ -2319,9 +2319,4 @@ def main():
 
     logger.info("PRO Bot started...")
     application.run_polling()
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("❕ ربات با دستور شما متوقف شد.")
 
