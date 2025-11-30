@@ -1,1532 +1,2320 @@
+# -*- coding: utf-8 -*-
+"""
+Gloria Clinic Telegram Bot - PRO Version
+
+ویژگی‌ها:
+- چند شعبه (کلینیک)
+- رزرو نوبت + یادآوری قبل نوبت + پیام مراقبت بعد درمان + امتیازدهی + Recall
+- پرداخت آفلاین (کارت به کارت) + پرداخت آنلاین (در حالت pending برای تأیید توسط ادمین)
+- مشاوره پوستی هوشمند (جواب اختصاصی بر اساس نوع پوست/مشکل/حساسیت)
+- پرونده الکترونیک زیبایی (سوابق نوبت، مشاوره، حساسیت، یادداشت‌های CRM)
+- پکیج درمانی (مثلاً ۳ جلسه جوانسازی، ۶ جلسه لیزر، با شمارش جلسات استفاده‌شده)
+- کد معرف / لینک من (Referral) + امتیاز معرف
+- پنل مدیریت با داشبورد، لیست کاربران، نوبت‌ها، پرداخت‌ها، مشاوره‌ها، پکیج‌ها و پیام گروهی
+"""
+
 import logging
-import re
-import sqlite3
 import os
-import json
-import urllib.parse
-import asyncio
-import secrets
-import string
+import random
+import sqlite3
 from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
 from telegram import (
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup, 
-    KeyboardButton, 
-    ReplyKeyboardMarkup, 
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    Update
+    Update,
 )
 from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    CallbackQueryHandler, 
-    MessageHandler, 
-    filters, 
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
-    ConversationHandler
+    MessageHandler,
+    filters,
 )
-import jdatetime
 
-# تنظیمات لاگ
+# ==================== CONFIG ====================
+
+CLINIC_NAME = "Gloria Clinic"
+
+# ⚠️ اینجا توکن واقعی ربات را از BotFather قرار بده
+TELEGRAM_BOT_TOKEN = "8437924316:AAFysR4_YGYr2HxhxLHWUVAJJdNHSXxNXns"
+
+# کارت برای پرداخت آفلاین
+CARD_NUMBER = "6037-XXXX-XXXX-XXXX"
+CARD_OWNER = "نام صاحب حساب"
+
+# اطلاعات ورود ادمین (می‌توانی عوضشان کنی)
+ADMIN_CREDENTIALS: Dict[str, str] = {
+    "admin": "1234",
+}
+
+# چند کلینیک (می‌توانی نام‌ها و شهرها را تغییر بدهی/اضافه کنی)
+CLINICS: Dict[int, Dict[str, str]] = {
+    1: {"name": "کلینیک مرکزی", "city": "تهران"},
+    2: {"name": "کلینیک شعبه غرب", "city": "تهران"},
+}
+
+# خدمات کلینیک
+SERVICES: Dict[str, Dict[str, Any]] = {
+    "laser": {"title": "لیزر موهای زائد", "price": 800_000, "tag": "Laser", "recall_days": 30},
+    "botox": {"title": "تزریق بوتاکس", "price": 1_500_000, "tag": "Botox", "recall_days": 120},
+    "clean": {"title": "پاکسازی پوست حرفه‌ای", "price": 650_000, "tag": "SkinCare", "recall_days": 60},
+    "meso": {"title": "مزوتراپی پوست", "price": 1_200_000, "tag": "Meso", "recall_days": 90},
+}
+
+# پکیج‌ها
+PACKAGES: Dict[str, Dict[str, Any]] = {
+    "pkg_young_3": {
+        "title": "پکیج جوانسازی ۳ جلسه‌ای",
+        "service_code": "meso",
+        "total_sessions": 3,
+        "price": 3_000_000,
+    },
+    "pkg_laser_6": {
+        "title": "پکیج لیزر ۶ جلسه‌ای",
+        "service_code": "laser",
+        "total_sessions": 6,
+        "price": 4_200_000,
+    },
+}
+
+DOCTORS: List[str] = ["دکتر احمدی", "دکتر رضایی", "دکتر محمدی"]
+
+TIME_SLOTS = ["10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00"]
+
+# state codes
+STATE_AWAITING_NAME = "awaiting_name"
+STATE_AWAITING_CLINIC = "awaiting_clinic"
+STATE_AWAITING_PHONE = "awaiting_phone"
+STATE_ADMIN_USERNAME = "awaiting_admin_username"
+STATE_ADMIN_PASSWORD = "awaiting_admin_password"
+STATE_AWAITING_RECEIPT_PHOTO = "awaiting_receipt_photo"
+STATE_AWAITING_CRM_NOTE = "awaiting_crm_note"
+STATE_AWAITING_ALLERGIES = "awaiting_allergies"
+STATE_AWAITING_BROADCAST_TEXT = "awaiting_broadcast_text"
+STATE_AWAITING_REFERRAL_CODE = "awaiting_referral_code"
+
+DB_PATH = "clinic_pro.db"
+
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = "8437924316:AAFysR4_YGYr2HxhxLHWUVAJJdNHSXxNXns"
 
-# حالت‌های مکالمه
-(
-    NAME, PHONE, 
-    CONSULT_SKIN_TYPE, CONSULT_SKIN_PROBLEM, CONSULT_SKIN_SENSITIVITY,
-    UPLOAD_RECEIPT,
-    ADMIN_LOGIN, ADMIN_REGISTRATION
-) = range(8)
+# ==================== DB Helpers ====================
 
-# ==================== DATABASE FUNCTIONS ====================
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def init_db():
-    """مقداردهی اولیه دیتابیس"""
-    if os.path.exists('clinic.db'):
-        os.remove('clinic.db')
-        logger.info("Old database deleted")
-    
-    conn = sqlite3.connect('clinic.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    # ایجاد جدول کاربران
-    cursor.execute('''
-        CREATE TABLE users (
+    conn = get_conn()
+    c = conn.cursor()
+
+    # clinics
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clinics (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            city TEXT
+        )
+        """
+    )
+
+    # users
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER UNIQUE,
             full_name TEXT,
             phone_number TEXT,
-            age INTEGER,
-            gender TEXT,
-            is_admin BOOLEAN DEFAULT FALSE,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            is_admin INTEGER DEFAULT 0,
+            tags TEXT DEFAULT '',
+            clinic_id INTEGER,
+            allergies TEXT DEFAULT '',
+            important_notes TEXT DEFAULT '',
+            referral_code TEXT UNIQUE,
+            referred_by_user_id INTEGER,
+            referral_points INTEGER DEFAULT 0,
+            created_at TEXT,
+            FOREIGN KEY(clinic_id) REFERENCES clinics(id)
         )
-    ''')
-    
-    # ایجاد جدول خدمات
-    cursor.execute('''
-        CREATE TABLE services (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            description TEXT,
-            base_price INTEGER,
-            category TEXT,
-            gender TEXT,
-            body_part TEXT,
-            duration INTEGER,
-            popular BOOLEAN DEFAULT FALSE
-        )
-    ''')
-    
-    # ایجاد جدول پزشکان
-    cursor.execute('''
-        CREATE TABLE doctors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            specialization TEXT,
-            bio TEXT,
-            experience TEXT,
-            services TEXT,
-            image TEXT,
-            available BOOLEAN DEFAULT TRUE
-        )
-    ''')
-    
-    # ایجاد جدول نوبت‌ها
-    cursor.execute('''
-        CREATE TABLE appointments (
+        """
+    )
+
+    # appointments
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            service_id INTEGER,
-            doctor_id INTEGER,
-            appointment_date DATE,
-            appointment_time TIME,
-            status TEXT DEFAULT 'pending',
-            payment_status TEXT DEFAULT 'pending',
-            receipt_photo TEXT,
-            notes TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            clinic_id INTEGER,
+            service_code TEXT,
+            service_title TEXT,
+            doctor_name TEXT,
+            date TEXT,
+            time TEXT,
+            status TEXT,
+            package_code TEXT,
+            package_session INTEGER,
+            created_at TEXT,
+            pre24_sent INTEGER DEFAULT 0,
+            pre3_sent INTEGER DEFAULT 0,
+            postcare_sent INTEGER DEFAULT 0,
+            rating_sent INTEGER DEFAULT 0,
+            recall_sent INTEGER DEFAULT 0,
             FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(service_id) REFERENCES services(id),
-            FOREIGN KEY(doctor_id) REFERENCES doctors(id)
+            FOREIGN KEY(clinic_id) REFERENCES clinics(id)
         )
-    ''')
-    
-    # ایجاد جدول پرداخت‌ها
-    cursor.execute('''
-        CREATE TABLE payments (
+        """
+    )
+
+    # payments
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
+            clinic_id INTEGER,
             appointment_id INTEGER,
             amount INTEGER,
-            payment_method TEXT,
-            receipt_photo TEXT,
-            status TEXT DEFAULT 'pending',
-            transaction_id TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            currency TEXT DEFAULT 'IRT',
+            method TEXT,
+            status TEXT,
+            receipt_file_id TEXT,
+            online_authority TEXT,
+            online_ref_id TEXT,
+            created_at TEXT,
             FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(appointment_id) REFERENCES appointments(id)
+            FOREIGN KEY(appointment_id) REFERENCES appointments(id),
+            FOREIGN KEY(clinic_id) REFERENCES clinics(id)
         )
-    ''')
-    
-    # ایجاد جدول مشاوره
-    cursor.execute('''
-        CREATE TABLE consultations (
+        """
+    )
+
+    # consultations
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS consultations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            consultation_type TEXT,
-            answers TEXT,
-            recommendation TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
+            clinic_id INTEGER,
+            skin_type TEXT,
+            problem TEXT,
+            sensitivity TEXT,
+            created_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(clinic_id) REFERENCES clinics(id)
         )
-    ''')
-    
-    # ایجاد جدول کدهای دعوت ادمین
-    cursor.execute('''
-        CREATE TABLE admin_invites (
+        """
+    )
+
+    # crm notes
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crm_notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE,
-            role TEXT,
-            max_uses INTEGER DEFAULT 1,
-            used_count INTEGER DEFAULT 0,
-            created_by INTEGER,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            expires_at DATETIME,
-            is_active BOOLEAN DEFAULT TRUE
+            user_id INTEGER,
+            clinic_id INTEGER,
+            admin_chat_id INTEGER,
+            note TEXT,
+            created_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(clinic_id) REFERENCES clinics(id)
         )
-    ''')
-    
-    # ایجاد جدول دسترسی‌های ادمین
-    cursor.execute('''
-        CREATE TABLE admin_access (
+        """
+    )
+
+    # ratings
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ratings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER UNIQUE,
-            role TEXT,
-            permissions TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            user_id INTEGER,
+            clinic_id INTEGER,
+            appointment_id INTEGER,
+            score INTEGER,
+            comment TEXT,
+            created_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(appointment_id) REFERENCES appointments(id),
+            FOREIGN KEY(clinic_id) REFERENCES clinics(id)
         )
-    ''')
-    
-    # ایجاد جدول تنظیمات ادمین
-    cursor.execute('''
-        CREATE TABLE admin_settings (
+        """
+    )
+
+    # user_packages
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_packages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            master_password TEXT,
-            support_phone TEXT
+            user_id INTEGER,
+            clinic_id INTEGER,
+            package_code TEXT,
+            total_sessions INTEGER,
+            used_sessions INTEGER DEFAULT 0,
+            status TEXT,
+            created_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(clinic_id) REFERENCES clinics(id)
         )
-    ''')
-    
-    # اضافه کردن داده‌های اولیه
-    add_sample_data(cursor)
-    
+        """
+    )
+
+    conn.commit()
+
+    # insert clinics if missing
+    for cid, info in CLINICS.items():
+        c.execute("SELECT id FROM clinics WHERE id = ?", (cid,))
+        if not c.fetchone():
+            c.execute(
+                "INSERT INTO clinics (id, name, city) VALUES (?, ?, ?)",
+                (cid, info["name"], info["city"]),
+            )
     conn.commit()
     conn.close()
-    logger.info("Database initialized successfully!")
 
-def add_sample_data(cursor):
-    """اضافه کردن داده‌های نمونه"""
-    
-    # خدمات لیزر
-    laser_services = [
-        ('لیزر صورت بانوان', 'لیزر کامل صورت و گردن', 800000, 'لیزر', 'زن', 'صورت', 30, True),
-        ('لیزر زیربغل بانوان', 'لیزر ناحیه زیربغل', 500000, 'لیزر', 'زن', 'زیربغل', 20, True),
-        ('لیزر بازو بانوان', 'لیزر کامل بازوها', 700000, 'لیزر', 'زن', 'بازو', 25, False),
-        ('لیزر ساق پا بانوان', 'لیزر ساق پا', 900000, 'لیزر', 'زن', 'ساق پا', 35, True),
-        ('لیزر ران بانوان', 'لیزر ران', 1100000, 'لیزر', 'زن', 'ران', 40, False),
-        ('لیزر بیکینی بانوان', 'لیزر ناحیه بیکینی', 600000, 'لیزر', 'زن', 'بیکینی', 30, True),
-        ('لیزر کامل بدن بانوان', 'لیزر کامل تمام بدن', 3500000, 'لیزر', 'زن', 'کل بدن', 120, True),
-        ('لیزر صورت آقایان', 'لیزر صورت و گردن', 1000000, 'لیزر', 'مرد', 'صورت', 40, True),
-        ('لیزر سینه آقایان', 'لیزر ناحیه سینه', 1200000, 'لیزر', 'مرد', 'سینه', 45, False),
-        ('لیزر شکم آقایان', 'لیزر ناحیه شکم', 900000, 'لیزر', 'مرد', 'شکم', 35, False),
-        ('لیزر پشت آقایان', 'لیزر کامل پشت', 1500000, 'لیزر', 'مرد', 'پشت', 50, True),
-        ('لیزر بازو آقایان', 'لیزر بازوها', 800000, 'لیزر', 'مرد', 'بازو', 30, True),
-        ('لیزر ران آقایان', 'لیزر ران', 1000000, 'لیزر', 'مرد', 'ران', 40, False),
-        ('لیزر کامل بدن آقایان', 'لیزر کامل تمام بدن', 4000000, 'لیزر', 'مرد', 'کل بدن', 150, True)
-    ]
-    
-    cursor.executemany('''
-        INSERT INTO services (name, description, base_price, category, gender, body_part, duration, popular)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', laser_services)
-    
-    # خدمات تزریقات زیبایی
-    injection_services = [
-        ('تزریق بوتاکس پیشانی', 'تزریق بوتاکس برای رفع چین و چروک پیشانی', 1500000, 'تزریقات', 'مشترک', 'پیشانی', 30, True),
-        ('تزریق بوتاکس دور چشم', 'تزریق بوتاکس برای خطوط دور چشم', 1200000, 'تزریقات', 'مشترک', 'دور چشم', 25, True),
-        ('تزریق فیلر لب', 'تزریق فیلر برای حجم دهی لب', 2500000, 'تزریقات', 'مشترک', 'لب', 45, True),
-        ('تزریق فیلر گونه', 'تزریق فیلر برای حجم دهی گونه', 3000000, 'تزریقات', 'مشترک', 'گونه', 50, True),
-        ('مزوتراپی صورت', 'مزوتراپی برای جوانسازی پوست صورت', 2000000, 'تزریقات', 'مشترک', 'صورت', 60, False),
-        ('تزریق چربی', 'تزریق چربی برای حجم دهی طبیعی', 4500000, 'تزریقات', 'مشترک', 'صورت', 90, False)
-    ]
-    
-    cursor.executemany('''
-        INSERT INTO services (name, description, base_price, category, gender, body_part, duration, popular)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', injection_services)
-    
-    # خدمات پوست
-    skin_services = [
-        ('پاکسازی پوست صورت', 'پاکسازی عمقی پوست با جدیدترین متدها', 800000, 'پوست', 'مشترک', 'صورت', 60, True),
-        ('میکرونیدلینگ', 'میکرونیدلینگ برای جوانسازی پوست', 1200000, 'پوست', 'مشترک', 'صورت', 45, True),
-        ('پیلینگ شیمیایی', 'پیلینگ شیمیایی برای روشن شدن پوست', 900000, 'پوست', 'مشترک', 'صورت', 30, False),
-        ('لیزر درمانی پوست', 'لیزر برای درمان لک و جوش', 1800000, 'پوست', 'مشترک', 'صورت', 40, True),
-        ('آبرسانی پوست', 'آبرسانی عمقی پوست با سرم‌های تخصصی', 600000, 'پوست', 'مشترک', 'صورت', 35, False)
-    ]
-    
-    cursor.executemany('''
-        INSERT INTO services (name, description, base_price, category, gender, body_part, duration, popular)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', skin_services)
-    
-    # خدمات کاشت مو
-    hair_services = [
-        ('کاشت مو FIT', 'کاشت مو به روش FIT', 15000000, 'کاشت مو', 'مشترک', 'سر', 240, True),
-        ('کاشت مو FUE', 'کاشت مو به روش FUE', 12000000, 'کاشت مو', 'مشترک', 'سر', 300, True),
-        ('کاشت ابرو', 'کاشت ابرو به روش طبیعی', 5000000, 'کاشت مو', 'مشترک', 'ابرو', 120, True),
-        ('کاشت ریش', 'کاشت ریش و سبیل', 8000000, 'کاشت مو', 'مرد', 'ریش', 180, False),
-        ('پروتز مو', 'پروتز مو برای پوشش کامل', 7000000, 'کاشت مو', 'مشترک', 'سر', 150, False)
-    ]
-    
-    cursor.executemany('''
-        INSERT INTO services (name, description, base_price, category, gender, body_part, duration, popular)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', hair_services)
-    
-    # پزشکان
-    doctors = [
-        ('دکتر مریم احمدی', 'پوست و زیبایی', 'متخصص پوست با ۱۲ سال سابقه، فلوشیپ لیزر از آلمان', '۱۲ سال', 'لیزر,پوست,تزریقات', '', True),
-        ('دکتر سارا محمدی', 'لیزر و زیبایی', 'متخصص زیبایی با ۱۰ سال سابقه در زمینه لیزر', '۱۰ سال', 'لیزر,پوست', '', True),
-        ('دکتر حمید کریمی', 'تزریقات زیبایی', 'متخصص تزریقات زیبایی با ۷ سال سابقه', '۷ سال', 'تزریقات', '', True),
-        ('دکتر علی رضایی', 'کاشت مو', 'جراح کاشت مو با ۸ سال سابقه، عضو انجمن کاشت موی ایران', '۸ سال', 'کاشت مو', '', True),
-        ('دکتر فاطمه نوروزی', 'پوست و مو', 'متخصص پوست و مو با ۹ سال سابقه', '۹ سال', 'پوست,لیزر', '', True)
-    ]
-    
-    cursor.executemany('''
-        INSERT INTO doctors (name, specialization, bio, experience, services, image, available)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', doctors)
-    
-    # کاربر ادمین اصلی
-    cursor.execute('''
-        INSERT OR REPLACE INTO users (chat_id, full_name, phone_number, is_admin)
-        VALUES (?, ?, ?, ?)
-    ''', (123456789, 'مدیر کلینیک', '09123456789', True))
-    
-    # اضافه کردن دسترسی ادمین
-    cursor.execute('SELECT id FROM users WHERE chat_id = ?', (123456789,))
-    admin_user_id = cursor.fetchone()[0]
-    
-    cursor.execute('''
-        INSERT OR REPLACE INTO admin_access (user_id, role, permissions)
-        VALUES (?, ?, ?)
-    ''', (admin_user_id, 'super_admin', 'all'))
-    
-    # تنظیم رمز عبور اصلی
-    cursor.execute('''
-        INSERT OR REPLACE INTO admin_settings (id, master_password, support_phone)
-        VALUES (1, '1234', '09190432181')
-    ''')
-    
-    # ایجاد یک کد دعوت نمونه
-    sample_code = generate_invite_code()
-    cursor.execute('''
-        INSERT INTO admin_invites (code, role, max_uses, expires_at)
-        VALUES (?, 'moderator', 3, datetime('now', '+30 days'))
-    ''', (sample_code,))
 
-def get_db_connection():
-    return sqlite3.connect('clinic.db', check_same_thread=False)
-
-def is_admin(chat_id, permission=None):
-    """بررسی آیا کاربر ادمین است"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    if permission == 'manage_invites':
-        cursor.execute('''
-            SELECT aa.role FROM admin_access aa
-            JOIN users u ON aa.user_id = u.id
-            WHERE u.chat_id = ? AND aa.role IN ('super_admin', 'admin')
-        ''', (chat_id,))
-    else:
-        cursor.execute('''
-            SELECT aa.role FROM admin_access aa
-            JOIN users u ON aa.user_id = u.id
-            WHERE u.chat_id = ?
-        ''', (chat_id,))
-    
-    result = cursor.fetchone()
+def get_user_by_chat(chat_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+    row = c.fetchone()
     conn.close()
-    
-    return result is not None
+    return row
 
-def get_admin_role(chat_id):
-    """دریافت نقش ادمین"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT aa.role FROM admin_access aa
-        JOIN users u ON aa.user_id = u.id
-        WHERE u.chat_id = ?
-    ''', (chat_id,))
-    result = cursor.fetchone()
+
+def get_user_by_id(user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
     conn.close()
-    return result[0] if result else None
+    return row
 
-def generate_invite_code(length=8):
-    """تولید کد دعوت تصادفی"""
-    alphabet = string.ascii_uppercase + string.digits
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def verify_invite_code(code):
-    """بررسی اعتبار کد دعوت"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, role, max_uses, used_count, expires_at, is_active 
-        FROM admin_invites 
-        WHERE code = ?
-    ''', (code,))
-    result = cursor.fetchone()
-    
-    if not result:
+def get_clinic(clinic_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM clinics WHERE id = ?", (clinic_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def get_or_create_user(chat_id: int, full_name: Optional[str] = None, clinic_id: Optional[int] = None):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+    row = c.fetchone()
+    if row:
         conn.close()
-        return None
-    
-    invite_id, role, max_uses, used_count, expires_at, is_active = result
-    
-    # بررسی انقضا
-    if expires_at and datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S') < datetime.now():
-        conn.close()
-        return None
-    
-    # بررسی تعداد استفاده
-    if used_count >= max_uses:
-        conn.close()
-        return None
-    
-    # بررسی فعال بودن
-    if not is_active:
-        conn.close()
-        return None
-    
-    # افزایش تعداد استفاده
-    cursor.execute('''
-        UPDATE admin_invites 
-        SET used_count = used_count + 1 
-        WHERE id = ?
-    ''', (invite_id,))
-    
+        return row
+
+    referral_code = f"GL{chat_id}{random.randint(100, 999)}"
+    c.execute(
+        """
+        INSERT INTO users (chat_id, full_name, clinic_id, referral_code, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (chat_id, full_name or "", clinic_id, referral_code, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    c.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def update_user_phone(chat_id: int, phone: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET phone_number = ? WHERE chat_id = ?", (phone, chat_id))
     conn.commit()
     conn.close()
-    
-    return role
 
-def save_user_to_db(chat_id, full_name, phone_number):
-    """ذخیره کاربر در دیتابیس"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-            INSERT OR REPLACE INTO users (chat_id, full_name, phone_number)
-            VALUES (?, ?, ?)
-        ''', (chat_id, full_name, phone_number))
-        conn.commit()
-        logger.info(f"User saved: {full_name}, {phone_number}")
-    except Exception as e:
-        logger.error(f"Error saving user: {e}")
-    finally:
+
+def update_user_clinic(chat_id: int, clinic_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET clinic_id = ? WHERE chat_id = ?", (clinic_id, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def update_user_allergies(user_id: int, text: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET allergies = ? WHERE id = ?", (text, user_id))
+    conn.commit()
+    conn.close()
+
+
+def set_user_tag(chat_id: int, tag: str, add: bool):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT tags FROM users WHERE chat_id = ?", (chat_id,))
+    row = c.fetchone()
+    if not row:
         conn.close()
-
-def validate_phone_number(phone):
-    """اعتبارسنجی شماره تلفن"""
-    phone = re.sub(r'\D', '', phone)
-    
-    if phone.startswith('98'):
-        phone = '0' + phone[2:]
-    elif phone.startswith('+98'):
-        phone = '0' + phone[3:]
-    
-    if len(phone) == 11 and phone.startswith('09'):
-        return phone
-    elif len(phone) == 10 and phone.startswith('9'):
-        return '0' + phone
-    
-    return None
-
-# ==================== SIMPLE ADMIN AUTHENTICATION ====================
-
-def verify_admin_simple(username, password):
-    """بررسی ساده اعتبار ادمین"""
-    admin_credentials = {
-        'admin': 'admin123',
-        'manager': 'manager123', 
-        'clinic': 'clinic2024'
-    }
-    return username in admin_credentials and admin_credentials[username] == password
-
-# ==================== BOT HANDLERS ====================
-
-async def safe_answer_query(query):
-    """پاسخ امن به query بدون ایجاد خطا"""
-    try:
-        await query.answer()
-    except Exception as e:
-        logger.warning(f"Query answer failed: {e}")
-
-async def start(update, context):
-    """دستور start"""
-    user = update.effective_user
-    
-    # بررسی ادمین بودن
-    if is_admin(user.id):
-        keyboard = [
-            [InlineKeyboardButton("👨‍💼 پنل مدیریت", callback_data="admin_panel")],
-            [InlineKeyboardButton("📅 رزرو نوبت", callback_data="menu_booking")],
-            [InlineKeyboardButton("💄 خدمات زیبایی", callback_data="menu_beauty")],
-            [InlineKeyboardButton("💬 مشاوره", callback_data="menu_consultation")],
-            [InlineKeyboardButton("📖 راهنمای استفاده", callback_data="menu_guide")],
-            [InlineKeyboardButton("🔐 دسترسی ادمین", callback_data="admin_access")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        admin_role = get_admin_role(user.id)
-        await update.message.reply_text(
-            f"👋 سلام {user.first_name}!\n"
-            "به کلینیک زیبایی گلوریا خوش آمدید!\n"
-            f"🔓 **شما به عنوان {admin_role} وارد شده‌اید.**",
-            reply_markup=reply_markup
-        )
         return
-    
-    # بررسی کاربر عادی
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT full_name FROM users WHERE chat_id = ?', (user.id,))
-    existing_user = cursor.fetchone()
+    tags_str = row["tags"] or ""
+    tags = {t.strip() for t in tags_str.split(",") if t.strip()}
+    if add:
+        tags.add(tag)
+    else:
+        tags.discard(tag)
+    new_tags = ",".join(sorted(tags))
+    c.execute("UPDATE users SET tags = ? WHERE chat_id = ?", (new_tags, chat_id))
+    conn.commit()
     conn.close()
-    
-    if existing_user:
-        await show_main_menu(update, context)
+
+
+def add_service_tag_to_user(user_id: int, service_code: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT chat_id FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
         return
-    
-    # کاربر جدید
-    await update.message.reply_text(
-        f"👋 سلام {user.first_name}! به کلینیک زیبایی گلوریا خوش آمدید!\n"
-        "لطفاً نام و نام خانوادگی خود را وارد کنید:"
-    )
-    context.user_data.clear()
-    context.user_data['awaiting_name'] = True
-
-async def show_main_menu(update, context):
-    """نمایش منوی اصلی"""
-    user = update.effective_user
-    
-    keyboard = [
-        [InlineKeyboardButton("💄 خدمات زیبایی", callback_data="menu_beauty")],
-        [InlineKeyboardButton("📅 رزرو نوبت", callback_data="menu_booking")],
-        [InlineKeyboardButton("💬 مشاوره هوشمند", callback_data="menu_consultation")],
-        [InlineKeyboardButton("👨‍⚕️ پزشکان ما", callback_data="menu_doctors")],
-        [InlineKeyboardButton("💳 پرداخت", callback_data="payment_receipt")],
-        [InlineKeyboardButton("📖 راهنمای استفاده", callback_data="menu_guide")],
-        [InlineKeyboardButton("📍 تماس با ما", callback_data="menu_contact")]
-    ]
-    
-    # اگر کاربر ادمین است، دکمه پنل مدیریت را اضافه کن
-    if is_admin(user.id) or context.user_data.get('admin_logged_in'):
-        keyboard.append([InlineKeyboardButton("👨‍💼 پنل مدیریت", callback_data="admin_panel_simple")])
-    else:
-        keyboard.append([InlineKeyboardButton("🔐 ورود به پنل مدیریت", callback_data="admin_login_simple")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(
-            "🏠 **منوی اصلی کلینیک گلوریا**\n\n"
-            "لطفاً گزینه مورد نظر را انتخاب کنید:",
-            reply_markup=reply_markup
-        )
-    else:
-        await update.callback_query.edit_message_text(
-            "🏠 **منوی اصلی کلینیک گلوریا**\n\n"
-            "لطفاً گزینه مورد نظر را انتخاب کنید:",
-            reply_markup=reply_markup
-        )
-
-# ==================== SIMPLE ADMIN SYSTEM ====================
-
-async def start_admin_login_simple(update, context):
-    """شروع ورود ادمین ساده"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    # ذخیره اطلاعات برای ردیابی حالت
-    context.user_data['awaiting_admin_username'] = True
-    
-    await query.edit_message_text(
-        "🔐 **ورود به پنل مدیریت**\n\n"
-        "لطفاً نام کاربری خود را وارد کنید:"
-    )
-
-async def handle_admin_username(update, context):
-    """دریافت نام کاربری ادمین"""
-    if not context.user_data.get('awaiting_admin_username'):
-        return
-    
-    username = update.message.text.strip()
-    context.user_data['admin_username'] = username
-    context.user_data['awaiting_admin_username'] = False
-    context.user_data['awaiting_admin_password'] = True
-    
-    await update.message.reply_text(
-        f"نام کاربری: {username}\n\n"
-        "لطفاً رمز عبور خود را وارد کنید:"
-    )
-
-async def handle_admin_password(update, context):
-    """دریافت رمز عبور ادمین"""
-    if not context.user_data.get('awaiting_admin_password'):
-        return
-    
-    password = update.message.text
-    username = context.user_data.get('admin_username')
-    
-    # پاک کردن حالت‌ها
-    context.user_data.pop('awaiting_admin_password', None)
-    
-    if verify_admin_simple(username, password):
-        # ورود موفق
-        context.user_data['admin_logged_in'] = True
-        context.user_data['admin_chat_id'] = update.effective_user.id
-        context.user_data['admin_username'] = username
-        
-        await update.message.reply_text(
-            f"✅ **ورود موفقیت‌آمیز**\n\n"
-            f"👋 سلام {username}!\n"
-            f"به پنل مدیریت کلینیک خوش آمدید.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👨‍💼 پنل مدیریت", callback_data="admin_panel_simple")],
-                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_main")]
-            ])
-        )
-    else:
-        await update.message.reply_text(
-            "❌ **ورود ناموفق**\n\n"
-            "نام کاربری یا رمز عبور اشتباه است.\n"
-            "لطفاً دوباره تلاش کنید.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔐 تلاش مجدد", callback_data="admin_login_simple")],
-                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_main")]
-            ])
-        )
-
-async def show_admin_panel_simple(update, context):
-    """نمایش پنل ادمین ساده"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    user_chat_id = update.effective_user.id
-    
-    if not (is_admin(user_chat_id) or context.user_data.get('admin_logged_in')):
-        await query.edit_message_text(
-            "❌ **دسترسی denied**\n\n"
-            "لطفاً ابتدا وارد سیستم شوید.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔐 ورود به پنل", callback_data="admin_login_simple")],
-                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_main")]
-            ])
-        )
-        return
-    
-    # دریافت آمار ساده
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM users WHERE is_admin = FALSE')
-    total_users = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM appointments')
-    total_appointments = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM appointments WHERE status = "pending"')
-    pending_appointments = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM payments WHERE status = "pending"')
-    pending_payments = cursor.fetchone()[0]
-    
+    chat_id = row["chat_id"]
     conn.close()
-    
-    keyboard = [
-        [InlineKeyboardButton("📊 مشاهده نوبت‌ها", callback_data="admin_view_appointments")],
-        [InlineKeyboardButton("💰 مشاهده پرداخت‌ها", callback_data="admin_view_payments")],
-        [InlineKeyboardButton("👥 مشاهده کاربران", callback_data="admin_view_users")],
-        [InlineKeyboardButton("📈 آمار کلی", callback_data="admin_view_stats")],
-        [InlineKeyboardButton("🚪 خروج", callback_data="admin_logout_simple")]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    panel_text = (
-        f"👨‍💼 **پنل مدیریت کلینیک**\n\n"
-        f"📊 **آمار سریع:**\n"
-        f"• 👥 کاربران: {total_users} نفر\n"
-        f"• 📅 نوبت‌ها: {total_appointments} نوبت\n"
-        f"• ⏳ نوبت‌های در انتظار: {pending_appointments}\n"
-        f"• 💰 پرداخت‌های در انتظار: {pending_payments}\n\n"
-        f"لطفاً بخش مورد نظر را انتخاب کنید:"
-    )
-    
-    await query.edit_message_text(panel_text, reply_markup=reply_markup)
+    tag = SERVICES.get(service_code, {}).get("tag")
+    if tag:
+        set_user_tag(chat_id, tag, add=True)
 
-async def admin_view_appointments(update, context):
-    """مشاهده نوبت‌ها"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    if not (is_admin(update.effective_user.id) or context.user_data.get('admin_logged_in')):
-        await query.edit_message_text("❌ لطفاً ابتدا وارد سیستم شوید.")
-        return
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT a.id, u.full_name, s.name, a.appointment_date, a.appointment_time, a.status
+
+def create_appointment(
+    user_id: int,
+    clinic_id: int,
+    service_code: str,
+    doctor: str,
+    date: str,
+    time: str,
+    package_code: Optional[str] = None,
+    package_session: Optional[int] = None,
+) -> int:
+    service_title = SERVICES.get(service_code, {}).get("title", service_code)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO appointments (
+            user_id, clinic_id, service_code, service_title, doctor_name,
+            date, time, status, package_code, package_session, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            clinic_id,
+            service_code,
+            service_title,
+            doctor,
+            date,
+            time,
+            "pending_payment",
+            package_code,
+            package_session,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    appt_id = c.lastrowid
+    conn.close()
+    return appt_id
+
+
+def get_appointment_by_id(appt_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM appointments WHERE id = ?", (appt_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def appointment_slot_taken(doctor: str, date: str, time: str) -> bool:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT COUNT(*) AS cnt FROM appointments
+        WHERE doctor_name = ? AND date = ? AND time = ?
+          AND status IN ('pending_payment','reserved','paid','package','confirmed')
+        """,
+        (doctor, date, time),
+    )
+    row = c.fetchone()
+    conn.close()
+    return (row["cnt"] or 0) > 0
+
+
+def update_appointment_status(appt_id: int, status: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE appointments SET status = ? WHERE id = ?", (status, appt_id))
+    conn.commit()
+    conn.close()
+
+
+def get_user_appointments(user_id: int, limit: int = 10):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM appointments WHERE user_id = ? ORDER BY date DESC, time DESC LIMIT ?",
+        (user_id, limit),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_upcoming_appointment(user_id: int):
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT * FROM appointments
+        WHERE user_id = ? AND date >= ?
+        ORDER BY date ASC, time ASC
+        LIMIT 1
+        """,
+        (user_id, today),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def create_payment(
+    user_id: int,
+    clinic_id: int,
+    appointment_id: int,
+    amount: int,
+    method: str,
+    status: str = "pending",
+    receipt_file_id: Optional[str] = None,
+    online_authority: Optional[str] = None,
+) -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO payments (
+            user_id, clinic_id, appointment_id, amount, method, status,
+            receipt_file_id, online_authority, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            clinic_id,
+            appointment_id,
+            amount,
+            method,
+            status,
+            receipt_file_id,
+            online_authority,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    pay_id = c.lastrowid
+    conn.close()
+    return pay_id
+
+
+def update_payment_status(payment_id: int, status: str, ref_id: Optional[str] = None):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE payments SET status = ?, online_ref_id = ? WHERE id = ?",
+        (status, ref_id, payment_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_payment_by_id(payment_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM payments WHERE id = ?", (payment_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def create_consultation(user_id: int, clinic_id: int, skin: str, problem: str, sens: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO consultations (user_id, clinic_id, skin_type, problem, sensitivity, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, clinic_id, skin, problem, sens, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def create_crm_note(user_id: int, clinic_id: int, admin_chat_id: int, note: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO crm_notes (user_id, clinic_id, admin_chat_id, note, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, clinic_id, admin_chat_id, note, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_crm_notes_for_user(user_id: int, limit: int = 10):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM crm_notes WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_last_users(limit: int = 20):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users ORDER BY id DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_last_appointments(limit: int = 20):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT a.*, u.full_name, cl.name AS clinic_name
         FROM appointments a
         LEFT JOIN users u ON a.user_id = u.id
-        LEFT JOIN services s ON a.service_id = s.id
-        ORDER BY a.created_at DESC
-        LIMIT 10
-    ''')
-    
-    appointments = cursor.fetchall()
+        LEFT JOIN clinics cl ON a.clinic_id = cl.id
+        ORDER BY a.date ASC, a.time ASC, a.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = c.fetchall()
     conn.close()
-    
-    if not appointments:
-        text = "📊 **نوبت‌ها**\n\nهیچ نوبتی ثبت نشده است."
-    else:
-        text = "📊 **۱۰ نوبت آخر**\n\n"
-        for apt in appointments:
-            apt_id, user_name, service_name, date, time, status = apt
-            status_icon = "✅" if status == 'confirmed' else "⏳" if status == 'pending' else "❌"
-            text += f"{status_icon} {user_name} - {service_name}\n📅 {date} ⏰ {time}\n🆔 کد: {apt_id}\n\n"
-    
-    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_simple")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(text, reply_markup=reply_markup)
+    return rows
 
-async def admin_view_payments(update, context):
-    """مشاهده پرداخت‌ها"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    if not (is_admin(update.effective_user.id) or context.user_data.get('admin_logged_in')):
-        await query.edit_message_text("❌ لطفاً ابتدا وارد سیستم شوید.")
-        return
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT p.id, u.full_name, p.amount, p.status, p.created_at
+
+def get_upcoming_appointments(days_ahead: int = 14):
+    today = datetime.now().strftime("%Y-%m-%d")
+    future = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT a.*, u.full_name, cl.name AS clinic_name
+        FROM appointments a
+        LEFT JOIN users u ON a.user_id = u.id
+        LEFT JOIN clinics cl ON a.clinic_id = cl.id
+        WHERE a.date BETWEEN ? AND ?
+        ORDER BY a.date ASC, a.time ASC
+        """,
+        (today, future),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_last_payments(limit: int = 20):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT p.*, u.full_name, cl.name AS clinic_name
         FROM payments p
         LEFT JOIN users u ON p.user_id = u.id
-        ORDER BY p.created_at DESC
-        LIMIT 10
-    ''')
-    
-    payments = cursor.fetchall()
+        LEFT JOIN clinics cl ON p.clinic_id = cl.id
+        ORDER BY p.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = c.fetchall()
     conn.close()
-    
-    if not payments:
-        text = "💰 **پرداخت‌ها**\n\nهیچ پرداختی ثبت نشده است."
-    else:
-        text = "💰 **۱۰ پرداخت آخر**\n\n"
-        for pay in payments:
-            pay_id, user_name, amount, status, created_at = pay
-            status_icon = "✅" if status == 'confirmed' else "⏳"
-            amount_text = f"{amount:,}" if amount else "0"
-            text += f"{status_icon} {user_name} - {amount_text} تومان\n🆔 کد: {pay_id}\n\n"
-    
-    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_simple")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(text, reply_markup=reply_markup)
+    return rows
 
-async def admin_view_users(update, context):
-    """مشاهده کاربران"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    if not (is_admin(update.effective_user.id) or context.user_data.get('admin_logged_in')):
-        await query.edit_message_text("❌ لطفاً ابتدا وارد سیستم شوید.")
-        return
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT full_name, phone_number, created_at
-        FROM users 
-        WHERE is_admin = FALSE
-        ORDER BY created_at DESC
-        LIMIT 10
-    ''')
-    
-    users = cursor.fetchall()
+
+def get_last_consultations(limit: int = 20):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT c.*, u.full_name, cl.name AS clinic_name
+        FROM consultations c
+        LEFT JOIN users u ON c.user_id = u.id
+        LEFT JOIN clinics cl ON c.clinic_id = cl.id
+        ORDER BY c.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = c.fetchall()
     conn.close()
-    
-    if not users:
-        text = "👥 **کاربران**\n\nهیچ کاربری ثبت نشده است."
-    else:
-        text = "👥 **۱۰ کاربر آخر**\n\n"
-        for user in users:
-            name, phone, created = user
-            text += f"👤 {name}\n📞 {phone}\n📅 {created[:10]}\n\n"
-    
-    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_simple")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(text, reply_markup=reply_markup)
+    return rows
 
-async def admin_view_stats(update, context):
-    """مشاهده آمار کلی"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    if not (is_admin(update.effective_user.id) or context.user_data.get('admin_logged_in')):
-        await query.edit_message_text("❌ لطفاً ابتدا وارد سیستم شوید.")
-        return
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM users WHERE is_admin = FALSE')
-    total_users = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM appointments')
-    total_appointments = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM services')
-    total_services = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM doctors')
-    total_doctors = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM payments WHERE status = "confirmed"')
-    confirmed_payments = cursor.fetchone()[0]
-    
+
+def get_user_packages(user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT * FROM user_packages
+        WHERE user_id = ? AND status = 'active'
+        ORDER BY id DESC
+        """,
+        (user_id,),
+    )
+    rows = c.fetchall()
     conn.close()
-    
-    text = (
-        "📈 **آمار کلی کلینیک**\n\n"
-        f"👥 کاربران: {total_users} نفر\n"
-        f"📅 نوبت‌ها: {total_appointments} نوبت\n"
-        f"📋 خدمات: {total_services} خدمت\n"
-        f"👨‍⚕️ پزشکان: {total_doctors} نفر\n"
-        f"💰 پرداخت‌های تأیید شده: {confirmed_payments} تراکنش\n\n"
-        f"🕒 تاریخ: {jdatetime.datetime.now().strftime('%Y/%m/%d')}"
+    return rows
+
+
+def create_user_package(user_id: int, clinic_id: int, package_code: str):
+    pkg = PACKAGES.get(package_code)
+    if not pkg:
+        return
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO user_packages (user_id, clinic_id, package_code, total_sessions, used_sessions, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            clinic_id,
+            package_code,
+            pkg["total_sessions"],
+            0,
+            "active",
+            datetime.utcnow().isoformat(),
+        ),
     )
-    
-    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_simple")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(text, reply_markup=reply_markup)
-
-async def admin_logout_simple(update, context):
-    """خروج از پنل مدیریت"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    context.user_data.pop('admin_logged_in', None)
-    context.user_data.pop('admin_chat_id', None)
-    context.user_data.pop('admin_username', None)
-    context.user_data.pop('awaiting_admin_username', None)
-    context.user_data.pop('awaiting_admin_password', None)
-    
-    await query.edit_message_text(
-        "✅ **خروج موفقیت‌آمیز**\n\n"
-        "شما از پنل مدیریت خارج شدید.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_main")]
-        ])
-    )
-
-# ==================== EXISTING FUNCTIONS ====================
-
-async def show_beauty_services(update, context):
-    """نمایش دسته‌بندی خدمات زیبایی"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    keyboard = [
-        [InlineKeyboardButton("⚡ خدمات لیزر", callback_data="laser_services")],
-        [InlineKeyboardButton("💉 تزریقات زیبایی", callback_data="category_تزریقات")],
-        [InlineKeyboardButton("✨ خدمات پوست", callback_data="category_پوست")],
-        [InlineKeyboardButton("💇 کاشت مو", callback_data="category_کاشت مو")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "💄 **خدمات زیبایی کلینیک گلوریا**\n\n"
-        "لطفاً دسته خدمت مورد نظر را انتخاب کنید:",
-        reply_markup=reply_markup
-    )
-
-async def show_laser_services(update, context):
-    """نمایش خدمات لیزر"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    keyboard = [
-        [InlineKeyboardButton("👩 لیزر بانوان", callback_data="laser_women")],
-        [InlineKeyboardButton("👨 لیزر آقایان", callback_data="laser_men")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_beauty")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "⚡ **خدمات لیزر موهای زائد**\n\n"
-        "لطفاً جنسیت خود را انتخاب کنید:",
-        reply_markup=reply_markup
-    )
-
-async def show_laser_by_gender(update, context):
-    """نمایش خدمات لیزر بر اساس جنسیت"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    gender = "زن" if query.data == "laser_women" else "مرد"
-    context.user_data['laser_gender'] = gender
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, name, base_price, duration 
-        FROM services 
-        WHERE category = 'لیزر' AND gender = ? AND popular = TRUE
-        ORDER BY base_price
-    ''', (gender,))
-    services = cursor.fetchall()
+    conn.commit()
     conn.close()
-    
-    keyboard = []
-    for service in services:
-        price_text = f"{service[2]:,}"
-        button_text = f"⚡ {service[1]} - {price_text} تومان"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"book_service_{service[0]}")])
-    
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="laser_services")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    gender_text = "بانوان" if gender == "زن" else "آقایان"
-    
-    await query.edit_message_text(
-        f"⚡ **لیزر {gender_text}**\n\n"
-        "لطفاً خدمت مورد نظر را انتخاب کنید:",
-        reply_markup=reply_markup
-    )
 
-async def handle_category_selection(update, context):
-    """انتخاب دسته خدمت"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    category = query.data.replace('category_', '')
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, name, description, base_price, duration
-        FROM services 
-        WHERE category = ? AND gender = 'مشترک' AND popular = TRUE
-        ORDER BY base_price
-    ''', (category,))
-    services = cursor.fetchall()
-    conn.close()
-    
-    if not services:
-        await query.edit_message_text("❌ خدمتی در این دسته یافت نشد.")
-        return
-    
-    keyboard = []
-    for service in services:
-        price_text = f"{service[3]:,}"
-        button_text = f"📋 {service[1]} - {price_text} تومان"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"book_service_{service[0]}")])
-    
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_beauty")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    category_names = {
-        'تزریقات': 'تزریقات زیبایی',
-        'پوست': 'خدمات پوست',
-        'کاشت مو': 'کاشت مو'
-    }
-    
-    await query.edit_message_text(
-        f"📋 **خدمات {category_names.get(category, category)}**\n\n"
-        "لطفاً خدمت مورد نظر را انتخاب کنید:",
-        reply_markup=reply_markup
-    )
 
-async def handle_service_selection_booking(update, context):
-    """انتخاب خدمت برای رزرو"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    service_id = query.data.split('_')[2]
-    context.user_data['selected_service'] = service_id
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT name, base_price, description FROM services WHERE id = ?', (service_id,))
-    service = cursor.fetchone()
-    
-    # دریافت پزشکان مرتبط
-    doctors = get_doctors_for_service(service_id)
-    conn.close()
-    
-    if not doctors:
-        keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="menu_beauty")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("❌ هیچ پزشکی برای این خدمت موجود نیست.", reply_markup=reply_markup)
-        return
-    
-    keyboard = []
-    for doctor in doctors:
-        keyboard.append([InlineKeyboardButton(
-            f"👨‍⚕️ {doctor[1]} - {doctor[2]}", 
-            callback_data=f'book_doctor_{doctor[0]}'
-        )])
-    
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_beauty")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        f"📅 **رزرو نوبت برای: {service[0]}**\n"
-        f"💰 هزینه: {service[1]:,} تومان\n"
-        f"📖 توضیحات: {service[2]}\n\n"
-        "لطفاً پزشک مورد نظر را انتخاب کنید:",
-        reply_markup=reply_markup
+def use_session_from_package(user_id: int, package_code: str) -> Optional[int]:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT * FROM user_packages
+        WHERE user_id = ? AND package_code = ? AND status = 'active'
+        ORDER BY id ASC
+        """,
+        (user_id, package_code),
     )
-
-async def handle_doctor_selection_calendar(update, context):
-    """نمایش تقویم بعد از انتخاب پزشک"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    doctor_id = query.data.split('_')[2]
-    context.user_data['selected_doctor'] = doctor_id
-    
-    # نمایش تقویم ساده‌شده
-    today = jdatetime.date.today()
-    
-    keyboard = []
-    # ایجاد ۷ روز آینده
-    for i in range(7):
-        current_date = today + timedelta(days=i)
-        date_str = current_date.strftime('%Y-%m-%d')
-        date_display = current_date.strftime('%d %B')
-        
-        callback_data = f"book_date_{date_str}_s{context.user_data['selected_service']}_d{doctor_id}"
-        keyboard.append([InlineKeyboardButton(f"📅 {date_display}", callback_data=callback_data)])
-    
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"book_service_{context.user_data['selected_service']}")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "📅 **انتخاب تاریخ نوبت**\n\n"
-        "لطفاً تاریخ مورد نظر را انتخاب کنید:",
-        reply_markup=reply_markup
-    )
-
-async def handle_date_selection(update, context):
-    """انتخاب تاریخ"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    data = query.data.split('_')
-    selected_date = data[2]
-    
-    # استخراج service_id و doctor_id
-    service_id = None
-    doctor_id = None
-    
-    for part in data:
-        if part.startswith('s'):
-            service_id = part[1:]
-        elif part.startswith('d'):
-            doctor_id = part[1:]
-    
-    context.user_data['selected_service'] = service_id
-    context.user_data['selected_doctor'] = doctor_id
-    context.user_data['selected_date'] = selected_date
-    
-    # دریافت زمان‌های خالی
-    available_slots = get_available_time_slots(doctor_id, selected_date)
-    
-    if not available_slots:
-        keyboard = [[InlineKeyboardButton("🔙 انتخاب تاریخ دیگر", callback_data=f"book_doctor_{doctor_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "❌ **در این تاریخ نوبت خالی موجود نیست.**\n\n"
-            "لطفاً تاریخ دیگری انتخاب کنید:",
-            reply_markup=reply_markup
-        )
-        return
-    
-    # نمایش زمان‌های خالی
-    keyboard = []
-    row = []
-    for i, slot in enumerate(available_slots):
-        row.append(InlineKeyboardButton(f"⏰ {slot}", callback_data=f'book_time_{slot}'))
-        if (i + 1) % 3 == 0:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت به تاریخ‌ها", callback_data=f"book_doctor_{doctor_id}")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # نمایش تاریخ به صورت فارسی
-    date_obj = jdatetime.datetime.strptime(selected_date, '%Y-%m-%d')
-    date_display = date_obj.strftime('%d %B %Y')
-    
-    await query.edit_message_text(
-        f"⏰ **انتخاب زمان برای {date_display}**\n\n"
-        "لطفاً زمان مورد نظر را انتخاب کنید:",
-        reply_markup=reply_markup
-    )
-
-async def handle_time_selection(update, context):
-    """انتخاب زمان نوبت"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    selected_time = query.data.split('_')[2]
-    context.user_data['selected_time'] = selected_time
-    
-    # ایجاد نوبت
-    user_id = get_user_id(update.effective_user.id)
-    
-    if not user_id:
-        await query.edit_message_text("❌ خطا در یافتن اطلاعات کاربر.")
-        return
-    
-    appointment_id = create_appointment(
-        user_id,
-        context.user_data['selected_service'],
-        context.user_data['selected_doctor'],
-        context.user_data['selected_date'],
-        selected_time
-    )
-    
-    if appointment_id:
-        # دریافت اطلاعات خدمت
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT s.name, s.base_price, d.name 
-            FROM services s, doctors d 
-            WHERE s.id = ? AND d.id = ?
-        ''', (context.user_data['selected_service'], context.user_data['selected_doctor']))
-        result = cursor.fetchone()
+    row = c.fetchone()
+    if not row:
         conn.close()
-        
-        service_name, service_price, doctor_name = result
-        
-        # نمایش تاریخ به صورت فارسی
-        date_obj = jdatetime.datetime.strptime(context.user_data['selected_date'], '%Y-%m-%d')
-        date_display = date_obj.strftime('%d %B %Y')
-        
-        success_text = (
-            f"🎉 **نوبت شما با موفقیت ثبت شد!**\n\n"
-            f"📋 خدمت: {service_name}\n"
-            f"👨‍⚕️ پزشک: {doctor_name}\n"
-            f"📅 تاریخ: {date_display}\n"
-            f"⏰ زمان: {selected_time}\n"
-            f"💰 هزینه: {service_price:,} تومان\n"
-            f"🆔 کد رهگیری: {appointment_id:04d}\n\n"
-            f"💳 **برای پرداخت از منوی پرداخت استفاده کنید.**"
-        )
-        
-        context.user_data['last_appointment_id'] = appointment_id
-        
-        keyboard = [
-            [InlineKeyboardButton("💳 پرداخت", callback_data="payment_receipt")],
-            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(success_text, reply_markup=reply_markup)
-    else:
-        await query.edit_message_text("❌ خطا در ثبت نوبت.")
-
-# ==================== PAYMENT SYSTEM ====================
-
-async def start_payment_with_receipt(update, context):
-    """شروع فرآیند پرداخت با آپلود فیش"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    payment_info = (
-        f"💳 **پرداخت با آپلود فیش**\n\n"
-        f"💳 **شماره کارت برای واریز:**\n"
-        f"`6219-8610-3456-7890`\n\n"
-        f"🏛️ **بانک:** پارسیان\n"
-        f"👤 **به نام:** کلینیک زیبایی گلوریا\n\n"
-        f"📸 لطفاً پس از واریز، عکس فیش واریزی را به همین ربات ارسال کنید.\n"
-        f"✅ پس از تأیید فیش، نوبت شما فعال خواهد شد.\n\n"
-        f"📞 **پشتیبانی:** ۰۹۱۹۰۴۳۲۱۸۱"
+        return None
+    used = row["used_sessions"] + 1
+    total = row["total_sessions"]
+    status = "active"
+    if used >= total:
+        status = "completed"
+    c.execute(
+        "UPDATE user_packages SET used_sessions = ?, status = ? WHERE id = ?",
+        (used, status, row["id"]),
     )
-    
-    keyboard = [
-        [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="back_to_main")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(payment_info, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    context.user_data['awaiting_receipt'] = True
-    return UPLOAD_RECEIPT
+    conn.commit()
+    conn.close()
+    return used
 
-async def handle_receipt_photo(update, context):
-    """دریافت عکس فیش واریزی"""
-    if not context.user_data.get('awaiting_receipt'):
-        return ConversationHandler.END
-    
+
+def insert_rating(user_id: int, clinic_id: int, appointment_id: int, score: int, comment: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO ratings (user_id, clinic_id, appointment_id, score, comment, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, clinic_id, appointment_id, score, comment, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_stats():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) AS cnt FROM users")
+    users_count = c.fetchone()["cnt"]
+    c.execute("SELECT COUNT(*) AS cnt FROM appointments")
+    appts_count = c.fetchone()["cnt"]
+    c.execute("SELECT COUNT(*) AS cnt FROM appointments WHERE status IN ('paid','package')")
+    appts_done = c.fetchone()["cnt"]
+    c.execute("SELECT SUM(amount) AS total FROM payments WHERE status = 'paid'")
+    rev_row = c.fetchone()
+    revenue = rev_row["total"] or 0
+
+    c.execute(
+        """
+        SELECT full_name, referral_points
+        FROM users
+        WHERE referral_points > 0
+        ORDER BY referral_points DESC
+        LIMIT 5
+        """
+    )
+    top_ref = c.fetchall()
+
+    conn.close()
+    return users_count, appts_count, appts_done, revenue, top_ref
+
+
+def appointment_datetime(appt_row: sqlite3.Row) -> Optional[datetime]:
     try:
+        return datetime.strptime(f"{appt_row['date']} {appt_row['time']}", "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
+def add_referral(new_user_id: int, referral_code: str) -> bool:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id FROM users WHERE referral_code = ?", (referral_code,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+    referrer_id = row["id"]
+    if referrer_id == new_user_id:
+        conn.close()
+        return False
+    c.execute(
+        "UPDATE users SET referred_by_user_id = ? WHERE id = ?",
+        (referrer_id, new_user_id),
+    )
+    c.execute(
+        "UPDATE users SET referral_points = referral_points + 1 WHERE id = ?",
+        (referrer_id,),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+# ==================== Keyboards ====================
+
+def clinics_keyboard():
+    buttons = []
+    for cid, info in CLINICS.items():
+        buttons.append([InlineKeyboardButton(info["name"], callback_data=f"clinic_{cid}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def main_menu_kb():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🗓 رزرو نوبت", callback_data="menu_booking")],
+            [InlineKeyboardButton("💳 پرداخت", callback_data="menu_payment")],
+            [InlineKeyboardButton("🩺 مشاوره پوستی هوشمند", callback_data="menu_consult")],
+            [InlineKeyboardButton("👤 پروفایل من", callback_data="menu_profile")],
+            [InlineKeyboardButton("👤 نوبت‌های من", callback_data="menu_my_appts")],
+            [InlineKeyboardButton("🎁 کد معرف / لینک من", callback_data="menu_referral")],
+            [InlineKeyboardButton("❓ سوالات پرتکرار", callback_data="menu_faq")],
+            [InlineKeyboardButton("ℹ️ درباره کلینیک", callback_data="menu_about")],
+            [InlineKeyboardButton("🔐 پنل مدیریت", callback_data="menu_admin_login")],
+        ]
+    )
+
+
+def back_main_kb():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ بازگشت به منوی اصلی", callback_data="back_to_main")]]
+    )
+
+
+def admin_main_kb():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 داشبورد", callback_data="admin_dashboard")],
+            [InlineKeyboardButton("👥 کاربران", callback_data="admin_users")],
+            [InlineKeyboardButton("🗓 نوبت‌ها", callback_data="admin_appts")],
+            [InlineKeyboardButton("📆 تقویم ۱۴ روز آینده", callback_data="admin_calendar")],
+            [InlineKeyboardButton("💳 پرداخت‌ها", callback_data="admin_payments")],
+            [InlineKeyboardButton("🩺 مشاوره‌ها", callback_data="admin_consults")],
+            [InlineKeyboardButton("🎁 پکیج‌ها", callback_data="admin_packages")],
+            [InlineKeyboardButton("📣 پیام گروهی", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("🚪 خروج از پنل", callback_data="admin_logout")],
+        ]
+    )
+
+
+def admin_back_kb():
+    return admin_main_kb()
+
+
+def faq_kb():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("قبل از لیزر چه کنم؟", callback_data="faq_before_laser")],
+            [InlineKeyboardButton("بعد از لیزر چه کنم؟", callback_data="faq_after_laser")],
+            [InlineKeyboardButton("بعد از مزوتراپی طبیعی است؟", callback_data="faq_after_meso")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
+        ]
+    )
+
+
+# ==================== Consultation Logic ====================
+
+def build_consultation_answer(skin: str, problem: str, sens: str) -> str:
+    skin_map = {
+        "normal": "نرمال",
+        "dry": "خشک",
+        "oily": "چرب",
+        "combo": "مختلط",
+    }
+    prob_map = {
+        "acne": "جوش/آکنه",
+        "spots": "لک و تیرگی",
+        "aging": "چروک و پیری",
+        "sensitive": "حساسیت و قرمزی",
+    }
+    sens_map = {
+        "low": "کم",
+        "medium": "متوسط",
+        "high": "زیاد",
+    }
+    skin_t = skin_map.get(skin, skin)
+    prob_t = prob_map.get(problem, problem)
+    sens_t = sens_map.get(sens, sens)
+
+    lines: List[str] = [
+        "✅ نتیجه مشاوره پوستی اختصاصی شما:",
+        "",
+        f"• نوع پوست: {skin_t}",
+        f"• مشکل اصلی: {prob_t}",
+        f"• میزان حساسیت: {sens_t}",
+        "",
+    ]
+
+    lines.append("🌅 روتین پیشنهادی صبح:")
+
+    if skin == "oily":
+        lines.append("• شست‌وشو با ژل ملایم مخصوص پوست چرب.")
+        lines.append("• مرطوب‌کننده سبک و غیرکومدون‌زا.")
+    elif skin == "dry":
+        lines.append("• شوینده کرمی و بدون سولفات.")
+        lines.append("• سرم آبرسان + کرم مرطوب‌کننده قوی‌تر.")
+    elif skin == "combo":
+        lines.append("• شوینده ملایم، کنترل چربی در ناحیه T.")
+        lines.append("• مرطوب‌کننده سبک، در صورت نیاز روی نواحی خشک قوی‌تر.")
+    else:
+        lines.append("• شوینده ملایم و مرطوب‌کننده سبک برای پوست نرمال.")
+
+    if problem == "acne":
+        lines.append("• محصول حاوی سالیسیلیک‌اسید یا بنزوئیل‌پراکسید (با نظر پزشک).")
+    elif problem == "spots":
+        lines.append("• سرم روشن‌کننده (ویتامین C، نیاسینامید).")
+    elif problem == "aging":
+        lines.append("• آنتی‌اکسیدان صبح (ویتامین C) + کرم دور چشم سبک.")
+    elif problem == "sensitive":
+        lines.append("• فقط محصولات مخصوص پوست حساس، بدون عطر و الکل.")
+
+    if sens == "high":
+        lines.append("• هر محصول جدید را ابتدا روی قسمت کوچک تست کنید.")
+
+    lines += ["", "🌙 روتین پیشنهادی شب:"]
+
+    if skin == "oily":
+        lines.append("• شست‌وشوی کامل برای حذف چربی و آلودگی.")
+    elif skin == "dry":
+        lines.append("• شوینده ملایم، سپس کرم یا بالم مغذی.")
+    elif skin == "combo":
+        lines.append("• شوینده ملایم، سپس آبرسان روی کل صورت.")
+    else:
+        lines.append("• شوینده ملایم و مرطوب‌کننده مناسب.")
+
+    if problem == "acne":
+        lines.append("• در صورت نسخه پزشک، رتینوئید موضعی شب‌ها.")
+    elif problem == "spots":
+        lines.append("• کرم تخصصی ضدلک شبانه (با نظر پزشک).")
+    elif problem == "aging":
+        lines.append("• کرم حاوی رتینول یا پپتید (با شروع تدریجی).")
+    elif problem == "sensitive":
+        lines.append("• تمرکز روی ترمیم‌کننده‌ها و پرهیز از اسیدهای قوی.")
+
+    if sens == "high":
+        lines.append("• از استفاده همزمان چند محصول فعال قوی خودداری کنید.")
+
+    if skin == "oily" and problem == "acne":
+        lines += [
+            "",
+            "💡 نکته مخصوص پوست چربِ جوش‌دار:",
+            "• از کرم‌های سنگین و روغنی پرهیز کنید.",
+            "• روبالشی و گوشی موبایل را مرتب تمیز کنید.",
+        ]
+    if skin == "dry" and problem == "aging":
+        lines += [
+            "",
+            "💡 نکته مخصوص پوست خشک و چروک:",
+            "• کم‌آبی پوست، چروک‌ها را عمیق‌تر نشان می‌دهد؛ آبرسانی منظم ضروری است.",
+        ]
+    if problem == "spots" and sens == "high":
+        lines += [
+            "",
+            "💡 نکته برای لک همراه با حساسیت:",
+            "• از معجون‌های خانگی اسیدی (لیمو، سرکه و...) پرهیز کنید.",
+        ]
+
+    lines += [
+        "",
+        "🔸 پیشنهاد خدمات در کلینیک:",
+    ]
+    if problem in ("acne", "spots"):
+        lines.append("• پاکسازی حرفه‌ای، فیشال، و در صورت نیاز لیزر یا مزوتراپی.")
+    if problem == "aging":
+        lines.append("• مشاوره بوتاکس، مزوتراپی، جوانسازی غیرتهاجمی.")
+    if problem == "sensitive":
+        lines.append("• تنظیم روتین فوق‌العاده ملایم + درمان قرمزی در صورت نیاز.")
+
+    lines += [
+        "",
+        f"در صورت تمایل می‌توانید از منوی «رزرو نوبت» یک مشاوره حضوری در {CLINIC_NAME} رزرو کنید. 🌿",
+    ]
+
+    return "\n".join(lines)
+
+
+# ==================== User Handlers ====================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    args = context.args or []
+    referral_code = args[0] if args else None
+
+    user = get_user_by_chat(chat_id)
+    if not user:
+        context.user_data["state"] = STATE_AWAITING_NAME
+        context.user_data["pending_referral_code"] = referral_code
+        await update.message.reply_text(
+            f"سلام 👋\nبه ربات {CLINIC_NAME} خوش آمدید.\n\n"
+            "لطفاً نام و نام خانوادگی خود را ارسال کنید.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await update.message.reply_text(
+            f"{user['full_name']} عزیز، خوش آمدید 🌷",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await update.message.reply_text("از منوی زیر استفاده کنید:", reply_markup=main_menu_kb())
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+    state = context.user_data.get("state")
+    logger.info("TEXT chat=%s state=%s text=%s", chat_id, state, text)
+
+    # ثبت نام - نام
+    if state == STATE_AWAITING_NAME:
+        context.user_data["temp_name"] = text
+        context.user_data["state"] = STATE_AWAITING_CLINIC
+        await update.message.reply_text(
+            "خیلی هم عالی 🙏\nحالا لطفاً کلینیک مورد نظر خود را انتخاب کنید:",
+            reply_markup=clinics_keyboard(),
+        )
+        return
+
+    # ثبت نام - شماره
+    if state == STATE_AWAITING_PHONE:
+        full_name = context.user_data.get("temp_name", "")
+        clinic_id = context.user_data.get("temp_clinic_id")
+        user = get_or_create_user(chat_id, full_name=full_name, clinic_id=clinic_id)
+        update_user_phone(chat_id, text)
+        ref_code = context.user_data.get("pending_referral_code")
+        if ref_code:
+            add_referral(user["id"], ref_code)
+        context.user_data["state"] = None
+        await update.message.reply_text("✅ ثبت‌نام شما با موفقیت انجام شد.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("از منوی زیر استفاده کنید:", reply_markup=main_menu_kb())
+        return
+
+    # لاگین ادمین - نام کاربری
+    if state == STATE_ADMIN_USERNAME:
+        context.user_data["admin_username"] = text
+        context.user_data["state"] = STATE_ADMIN_PASSWORD
+        await update.message.reply_text("🔑 لطفاً رمز عبور را ارسال کنید:")
+        return
+
+    # لاگین ادمین - پسورد
+    if state == STATE_ADMIN_PASSWORD:
+        username = context.user_data.get("admin_username")
+        password = text
+        if username in ADMIN_CREDENTIALS and ADMIN_CREDENTIALS[username] == password:
+            context.user_data["is_admin"] = True
+            context.user_data["state"] = None
+            await update.message.reply_text("✅ ورود به پنل مدیریت موفق بود.")
+            await update.message.reply_text("📊 پنل مدیریت:", reply_markup=admin_main_kb())
+        else:
+            context.user_data["state"] = None
+            await update.message.reply_text("❌ نام کاربری یا رمز عبور اشتباه است.")
+            await update.message.reply_text("منوی اصلی:", reply_markup=main_menu_kb())
+        return
+
+    # یادداشت CRM
+    if state == STATE_AWAITING_CRM_NOTE:
+        target_user_id = context.user_data.get("crm_target_user_id")
+        if target_user_id:
+            u = get_user_by_id(target_user_id)
+            clinic_id = u["clinic_id"] if u else None
+            create_crm_note(target_user_id, clinic_id, chat_id, text)
+            context.user_data["state"] = None
+            await update.message.reply_text("✅ یادداشت CRM ذخیره شد.", reply_markup=admin_back_kb())
+        else:
+            await update.message.reply_text("❌ کاربر هدف برای CRM یافت نشد.", reply_markup=admin_back_kb())
+        return
+
+    # حساسیت‌ها
+    if state == STATE_AWAITING_ALLERGIES:
+        target_user_id = context.user_data.get("allergy_target_user_id")
+        if target_user_id:
+            update_user_allergies(target_user_id, text)
+            context.user_data["state"] = None
+            await update.message.reply_text("✅ حساسیت‌ها/هشدارها ثبت شد.", reply_markup=admin_back_kb())
+        else:
+            await update.message.reply_text("❌ کاربر هدف یافت نشد.", reply_markup=admin_back_kb())
+        return
+
+    # پیام گروهی
+    if state == STATE_AWAITING_BROADCAST_TEXT:
+        segment = context.user_data.get("broadcast_segment")
+        context.user_data["state"] = None
+        await do_broadcast(context, chat_id, segment, text)
+        return
+
+    # کد معرف
+    if state == STATE_AWAITING_REFERRAL_CODE:
+        context.user_data["state"] = None
+        user = get_user_by_chat(chat_id)
+        if not user:
+            await update.message.reply_text("ابتدا باید ثبت‌نام کنید. /start", reply_markup=back_main_kb())
+            return
+        ok = add_referral(user["id"], text)
+        if ok:
+            await update.message.reply_text(
+                "✅ کد معرف با موفقیت ثبت شد. از همراهی شما متشکریم.",
+                reply_markup=main_menu_kb(),
+            )
+        else:
+            await update.message.reply_text(
+                "❌ کد معرف نامعتبر است یا نمی‌توانید خودتان را به‌عنوان معرف ثبت کنید.",
+                reply_markup=main_menu_kb(),
+            )
+        return
+
+    # امتیازدهی ۱ تا ۵
+    try:
+        score = int(text)
+        if 1 <= score <= 5:
+            user = get_user_by_chat(chat_id)
+            if user:
+                appts = get_user_appointments(user["id"], limit=1)
+                if appts:
+                    appt = appts[0]
+                    insert_rating(user["id"], user["clinic_id"], appt["id"], score, "")
+                    await update.message.reply_text("⭐️ ممنون از امتیاز شما.", reply_markup=main_menu_kb())
+                    return
+    except Exception:
+        pass
+
+    # حالت پیش‌فرض
+    await update.message.reply_text("لطفاً از منوی زیر انتخاب کنید:", reply_markup=main_menu_kb())
+
+
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = context.user_data.get("state")
+    if state == STATE_AWAITING_PHONE and update.message.contact:
+        full_name = context.user_data.get("temp_name", update.message.from_user.full_name)
+        phone = update.message.contact.phone_number
+        clinic_id = context.user_data.get("temp_clinic_id")
+        user = get_or_create_user(chat_id, full_name=full_name, clinic_id=clinic_id)
+        update_user_phone(chat_id, phone)
+        ref_code = context.user_data.get("pending_referral_code")
+        if ref_code:
+            add_referral(user["id"], ref_code)
+        context.user_data["state"] = None
+        await update.message.reply_text("✅ ثبت‌نام شما کامل شد.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("از منوی زیر استفاده کنید:", reply_markup=main_menu_kb())
+    else:
+        await update.message.reply_text("این شماره را در این مرحله نیاز ندارم. از منو استفاده کنید.")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = context.user_data.get("state")
+    if state == STATE_AWAITING_RECEIPT_PHOTO:
+        appt_id = context.user_data.get("receipt_appt_id")
+        user = get_user_by_chat(chat_id)
+        if not user or not appt_id:
+            await update.message.reply_text("❌ نوبت یا کاربر یافت نشد.", reply_markup=back_main_kb())
+            return
+        appt = get_appointment_by_id(appt_id)
+        if not appt:
+            await update.message.reply_text("❌ نوبت یافت نشد.", reply_markup=back_main_kb())
+            return
+        service_code = appt["service_code"]
+        amount = SERVICES.get(service_code, {}).get("price", 500_000)
         photo = update.message.photo[-1]
         file_id = photo.file_id
-        
-        # ذخیره اطلاعات پرداخت
-        user_id = get_user_id(update.effective_user.id)
-        
-        if user_id:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO payments (user_id, amount, payment_method, receipt_photo, status)
-                VALUES (?, 0, 'receipt', ?, 'pending')
-            ''', (user_id, file_id))
-            
-            conn.commit()
-            conn.close()
-            
-            # اطلاع به ادمین
-            await notify_admin_new_receipt(context, file_id, update.effective_user.full_name)
-        
-        context.user_data['awaiting_receipt'] = False
-        
-        await update.message.reply_text(
-            "✅ فیش واریزی شما دریافت شد و در انتظار تأیید می‌باشد.\n"
-            "🔔 پس از تأیید، از طریق ربات به شما اطلاع داده خواهد شد.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_to_main")]])
+        create_payment(
+            user_id=appt["user_id"],
+            clinic_id=appt["clinic_id"],
+            appointment_id=appt_id,
+            amount=amount,
+            method="offline",
+            status="pending",
+            receipt_file_id=file_id,
         )
-        
-        return ConversationHandler.END
-    except Exception as e:
-        logger.error(f"Error handling receipt: {e}")
-        await update.message.reply_text("❌ خطا در پردازش فیش. لطفاً دوباره تلاش کنید.")
-
-async def notify_admin_new_receipt(context, file_id, user_name):
-    """اطلاع به ادمین درباره فیش جدید"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # پیدا کردن ادمین‌ها
-        cursor.execute('''
-            SELECT u.chat_id FROM users u
-            JOIN admin_access aa ON u.id = aa.user_id
-        ''')
-        admins = cursor.fetchall()
-        conn.close()
-        
-        if admins:
-            message_text = (
-                f"🔔 **فیش واریزی جدید**\n\n"
-                f"👤 کاربر: {user_name}\n"
-                f"📅 زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
-            
-            for admin in admins:
-                try:
-                    await context.bot.send_photo(
-                        chat_id=admin[0],
-                        photo=file_id,
-                        caption=message_text
-                    )
-                except Exception as e:
-                    logger.error(f"Error notifying admin: {e}")
-    except Exception as e:
-        logger.error(f"Error in notify_admin: {e}")
-
-# ==================== MESSAGE HANDLERS ====================
-
-async def handle_message(update, context):
-    """هندلر پیام‌های متنی"""
-    # اول بررسی کن اگر کاربر در حال ورود ادمین است
-    if context.user_data.get('awaiting_admin_username'):
-        await handle_admin_username(update, context)
-        return
-    
-    if context.user_data.get('awaiting_admin_password'):
-        await handle_admin_password(update, context)
-        return
-    
-    if context.user_data.get('in_conversation'):
-        return
-    
-    if context.user_data.get('awaiting_name'):
-        full_name = update.message.text
-        context.user_data['full_name'] = full_name
-        context.user_data['awaiting_name'] = False
-        context.user_data['awaiting_phone'] = True
-        
-        keyboard = [
-            [KeyboardButton("📞 اشتراک‌گذاری شماره تماس", request_contact=True)],
-            [KeyboardButton("📝 وارد کردن دستی شماره")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-        
+        context.user_data["state"] = None
         await update.message.reply_text(
-            f"ممنون {full_name}!\nلطفاً شماره تماس خود را وارد کنید:",
-            reply_markup=reply_markup
+            "✅ تصویر رسید دریافت و برای بررسی ثبت شد.\n"
+            "پس از تأیید توسط ادمین، نوبت شما قطعی می‌شود.",
+            reply_markup=main_menu_kb(),
         )
-        return
-    
-    elif context.user_data.get('awaiting_phone'):
-        phone_text = update.message.text
-        
-        if phone_text == "📝 وارد کردن دستی شماره":
-            await update.message.reply_text("لطفاً شماره تماس خود را وارد کنید:\nمثال: ۰۹۱۲۳۴۵۶۷۸۹")
-            return
-        
-        phone_number = validate_phone_number(phone_text)
-        if not phone_number:
-            await update.message.reply_text("❌ شماره تماس معتبر نیست! لطفاً دوباره وارد کنید.")
-            return
-        
-        context.user_data['phone_number'] = phone_number
-        context.user_data['awaiting_phone'] = False
-        
-        save_user_to_db(update.effective_user.id, context.user_data['full_name'], phone_number)
-        
-        remove_keyboard = ReplyKeyboardRemove()
-        await update.message.reply_text(
-            f"✅ اطلاعات شما ثبت شد!\n📋 نام: {context.user_data['full_name']}\n📞 تلفن: {phone_number}",
-            reply_markup=remove_keyboard
-        )
-        
-        await show_main_menu(update, context)
-        return
-    
     else:
-        await update.message.reply_text("لطفاً از منوی اصلی استفاده کنید.")
+        await update.message.reply_text("این عکس در این مرحله لازم نبود. از منو استفاده کنید.")
 
-async def handle_contact(update, context):
-    """هندلر اشتراک‌گذاری شماره تماس"""
-    if context.user_data.get('awaiting_phone'):
-        phone_number = update.message.contact.phone_number
-        context.user_data['phone_number'] = phone_number
-        context.user_data['awaiting_phone'] = False
-        
-        save_user_to_db(update.effective_user.id, context.user_data['full_name'], phone_number)
-        
-        remove_keyboard = ReplyKeyboardRemove()
-        await update.message.reply_text(
-            f"✅ اطلاعات شما ثبت شد!\n📋 نام: {context.user_data['full_name']}\n📞 تلفن: {phone_number}",
-            reply_markup=remove_keyboard
+
+# ==================== Broadcast Helper ====================
+
+async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, admin_chat_id: int, segment: str, text: str):
+    conn = get_conn()
+    c = conn.cursor()
+    if segment == "ALL":
+        c.execute("SELECT chat_id FROM users")
+    else:
+        like = f"%{segment}%"
+        c.execute("SELECT chat_id FROM users WHERE tags LIKE ?", (like,))
+    rows = c.fetchall()
+    conn.close()
+
+    app: Application = context.application  # type: ignore
+    success = 0
+    for r in rows:
+        try:
+            await app.bot.send_message(chat_id=r["chat_id"], text=text)
+            success += 1
+        except Exception as e:
+            logger.exception("broadcast error to %s: %s", r["chat_id"], e)
+
+    try:
+        await app.bot.send_message(
+            chat_id=admin_chat_id,
+            text=f"پیام برای {success} کاربر در گروه {segment} ارسال شد.",
         )
-        
-        await show_main_menu(update, context)
+    except Exception:
+        pass
 
-# ==================== UTILITY FUNCTIONS ====================
 
-def get_available_time_slots(doctor_id, appointment_date):
-    """دریافت زمان‌های خالی برای یک پزشک در تاریخ مشخص"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT appointment_time FROM appointments 
-            WHERE doctor_id = ? AND appointment_date = ? AND status != 'cancelled'
-        ''', (doctor_id, appointment_date))
-        
-        booked_slots = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        
-        # زمان‌های کاری کلینیک
-        all_slots = []
-        start_time = datetime.strptime('09:00', '%H:%M')
-        end_time = datetime.strptime('21:00', '%H:%M')
-        
-        current_time = start_time
-        while current_time < end_time:
-            time_str = current_time.strftime('%H:%M')
-            if time_str not in booked_slots:
-                all_slots.append(time_str)
-            current_time += timedelta(minutes=30)
-        
-        return all_slots
-    except Exception as e:
-        logger.error(f"Error getting time slots: {e}")
-        return ['10:00', '11:00', '12:00', '14:00', '15:00', '16:00', '17:00', '18:00']
+# ==================== Callback Router ====================
 
-def get_doctors_for_service(service_id):
-    """دریافت پزشکان مرتبط با یک خدمت"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT category FROM services WHERE id = ?', (service_id,))
-        result = cursor.fetchone()
-        if not result:
-            return []
-        
-        service_category = result[0]
-        
-        cursor.execute('SELECT id, name, specialization FROM doctors WHERE services LIKE ? AND available = TRUE', (f'%{service_category}%',))
-        doctors = cursor.fetchall()
-        conn.close()
-        
-        return doctors
-    except Exception as e:
-        logger.error(f"Error getting doctors: {e}")
-        return [(1, 'دکتر مریم احمدی', 'پوست و زیبایی'), (2, 'دکتر سارا محمدی', 'لیزر و زیبایی')]
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat.id
+    logger.info("CALLBACK data=%s chat=%s", data, chat_id)
 
-def get_user_id(chat_id):
-    """دریافت ID کاربر از chat_id"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT id FROM users WHERE chat_id = ?', (chat_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else None
-    except Exception as e:
-        logger.error(f"Error getting user id: {e}")
-        return 1
+    # برگشت به منوی اصلی
+    if data == "back_to_main":
+        await query.message.reply_text("منوی اصلی:", reply_markup=main_menu_kb())
+        return
 
-def create_appointment(user_id, service_id, doctor_id, appointment_date, appointment_time):
-    """ایجاد نوبت جدید"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO appointments (user_id, service_id, doctor_id, appointment_date, appointment_time, status)
-            VALUES (?, ?, ?, ?, ?, 'pending')
-        ''', (user_id, service_id, doctor_id, appointment_date, appointment_time))
-        
-        appointment_id = cursor.lastrowid
+    # انتخاب کلینیک در ثبت‌نام
+    if data.startswith("clinic_"):
+        cid = int(data.replace("clinic_", ""))
+        context.user_data["temp_clinic_id"] = cid
+        context.user_data["state"] = STATE_AWAITING_PHONE
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("📱 ارسال شماره من", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await query.message.reply_text(
+            "لطفاً شماره موبایل خود را ارسال کنید یا روی دکمه زیر بزنید:",
+            reply_markup=kb,
+        )
+        return
+
+    # ---------- Booking ----------
+    if data == "menu_booking":
+        buttons = [
+            [InlineKeyboardButton(f"{info['title']} - {info['price']:,} تومان", callback_data=f"svc_{code}")]
+            for code, info in SERVICES.items()
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")])
+        await query.message.reply_text(
+            "لطفاً خدمت مورد نظر را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("svc_"):
+        service_code = data.replace("svc_", "")
+        context.user_data["booking"] = {"service_code": service_code}
+        buttons = [
+            [InlineKeyboardButton(name, callback_data=f"doc_{i}")]
+            for i, name in enumerate(DOCTORS)
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="menu_booking")])
+        await query.message.reply_text("پزشک مورد نظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("doc_"):
+        idx = int(data.replace("doc_", ""))
+        if idx < 0 or idx >= len(DOCTORS):
+            await query.message.reply_text("❌ پزشک نامعتبر.", reply_markup=back_main_kb())
+            return
+        booking = context.user_data.get("booking", {})
+        booking["doctor"] = DOCTORS[idx]
+        context.user_data["booking"] = booking
+
+        buttons = []
+        today = datetime.now()
+        for i in range(7):
+            d = today + timedelta(days=i + 1)
+            label = d.strftime("%Y-%m-%d")
+            buttons.append([InlineKeyboardButton(label, callback_data=f"date_{label}")])
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="menu_booking")])
+        await query.message.reply_text("تاریخ را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("date_"):
+        date_str = data.replace("date_", "")
+        booking = context.user_data.get("booking", {})
+        booking["date"] = date_str
+        context.user_data["booking"] = booking
+
+        doctor = booking.get("doctor")
+        buttons = []
+        for t in TIME_SLOTS:
+            if appointment_slot_taken(doctor, date_str, t):
+                label = f"{t} (پر)"
+                buttons.append([InlineKeyboardButton(label, callback_data="noop")])
+            else:
+                buttons.append([InlineKeyboardButton(t, callback_data=f"time_{t.replace(':','')}")])
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="menu_booking")])
+        await query.message.reply_text(
+            f"تاریخ انتخاب‌شده: {date_str}\n\nلطفاً ساعت را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data == "noop":
+        await query.answer("این ساعت پر است.", show_alert=True)
+        return
+
+    if data.startswith("time_"):
+        time_code = data.replace("time_", "")
+        time_str = f"{time_code[:2]}:{time_code[2:]}"
+        booking = context.user_data.get("booking", {})
+        booking["time"] = time_str
+        context.user_data["booking"] = booking
+
+        user = get_user_by_chat(chat_id)
+        if not user:
+            await query.message.reply_text("ابتدا باید ثبت‌نام کنید. /start", reply_markup=back_main_kb())
+            return
+        if not user["clinic_id"]:
+            await query.message.reply_text(
+                "کلینیک شما مشخص نیست. لطفاً دوباره /start را بزنید.",
+                reply_markup=back_main_kb(),
+            )
+            return
+
+        clinic_id = user["clinic_id"]
+        service_code = booking.get("service_code")
+        doctor = booking.get("doctor")
+        date_str = booking.get("date")
+        if not (service_code and doctor and date_str):
+            await query.message.reply_text(
+                "❌ خطا در اطلاعات نوبت، لطفاً از ابتدا رزرو را انجام دهید.",
+                reply_markup=back_main_kb(),
+            )
+            return
+
+        if appointment_slot_taken(doctor, date_str, time_str):
+            await query.message.reply_text("❌ این ساعت همین لحظه پر شد. لطفاً ساعت دیگری انتخاب کنید.", reply_markup=back_main_kb())
+            return
+
+        # چک پکیج فعال برای این خدمت
+        user_packs = get_user_packages(user["id"])
+        pkg_for_service = None
+        for up in user_packs:
+            info = PACKAGES.get(up["package_code"])
+            if info and info["service_code"] == service_code and up["status"] == "active":
+                pkg_for_service = up["package_code"]
+                break
+
+        try:
+            appt_id = create_appointment(
+                user_id=user["id"],
+                clinic_id=clinic_id,
+                service_code=service_code,
+                doctor=doctor,
+                date=date_str,
+                time=time_str,
+            )
+        except Exception as e:
+            logger.exception("create_appointment error: %s", e)
+            await query.message.reply_text(f"❌ خطا در ثبت نوبت: {e}", reply_markup=back_main_kb())
+            return
+
+        service_title = SERVICES.get(service_code, {}).get("title", service_code)
+        amount = SERVICES.get(service_code, {}).get("price", 500_000)
+
+        text = (
+            "✅ نوبت شما موقتاً ثبت شد.\n\n"
+            f"خدمت: {service_title}\n"
+            f"پزشک: {doctor}\n"
+            f"تاریخ: {date_str}\n"
+            f"ساعت: {time_str}\n"
+        )
+
+        buttons = []
+        if pkg_for_service:
+            text += "\nشما یک پکیج فعال برای این خدمت دارید. مایلید از پکیج استفاده کنید یا برای این نوبت پرداخت جداگانه انجام دهید؟"
+            buttons.append(
+                [
+                    InlineKeyboardButton("🎁 استفاده از پکیج", callback_data=f"usepkg_{appt_id}_{pkg_for_service}"),
+                    InlineKeyboardButton("💳 پرداخت این نوبت", callback_data=f"pay_appt_{appt_id}"),
+                ]
+            )
+        else:
+            text += f"\nمبلغ: {amount:,} تومان\n\nبرای پرداخت، روی دکمه زیر بزنید:"
+            buttons.append([InlineKeyboardButton("💳 پرداخت این نوبت", callback_data=f"pay_appt_{appt_id}")])
+
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت به منوی اصلی", callback_data="back_to_main")])
+
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("usepkg_"):
+        _, appt_id_str, pkg_code = data.split("_", 2)
+        appt_id = int(appt_id_str)
+        appt = get_appointment_by_id(appt_id)
+        if not appt:
+            await query.message.reply_text("❌ نوبت یافت نشد.", reply_markup=back_main_kb())
+            return
+        session_no = use_session_from_package(appt["user_id"], pkg_code)
+        if not session_no:
+            await query.message.reply_text("❌ پکیج فعال برای این خدمت یافت نشد.", reply_markup=back_main_kb())
+            return
+
+        conn = get_conn()
+        conn.execute(
+            "UPDATE appointments SET status = 'package', package_code = ?, package_session = ? WHERE id = ?",
+            (pkg_code, session_no, appt_id),
+        )
         conn.commit()
-        logger.info(f"Appointment created: ID {appointment_id}")
-        return appointment_id
-    except Exception as e:
-        logger.error(f"Error creating appointment: {e}")
-        return 1000 + user_id
-    finally:
         conn.close()
 
-async def show_contact_info(update, context):
-    """نمایش اطلاعات تماس"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    contact_text = (
-        "📍 **اطلاعات تماس کلینیک گلوریا**\n\n"
-        "📞 تلفن: ۰۲۱-۸۸۵۶۱۲۳۴\n"
-        "📱 واتساپ: ۰۹۱۹۰۴۳۲۱۸۱\n"
-        "🏢 آدرس: تهران، خیابان ولیعصر، بالاتر از میدان ونک، پلاک ۲۱۰۰\n\n"
-        "🕒 ساعت کاری:\n"
-        "شنبه تا پنجشنبه: ۹:۰۰ تا ۲۱:۰۰\n"
-        "جمعه: ۱۰:۰۰ تا ۱۸:۰۰"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="back_to_main")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(contact_text, reply_markup=reply_markup)
+        add_service_tag_to_user(appt["user_id"], appt["service_code"])
 
-async def show_guide(update, context):
-    """نمایش راهنمای استفاده"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    guide_text = (
-        "📖 **راهنمای استفاده از ربات**\n\n"
-        "🎯 **نوبت‌گیری:** از منوی اصلی گزینه رزرو نوبت را انتخاب کنید\n"
-        "💬 **مشاوره:** پاسخ سوالات تخصصی پوست و زیبایی\n"
-        "💳 **پرداخت:** آپلود فیش واریزی\n"
-        "👨‍💼 **ادمین:** مشاهده گزارش‌ها و مدیریت\n\n"
-        "📞 **پشتیبانی:** ۰۹۱۹۰۴۳۲۱۸۱"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="back_to_main")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(guide_text, reply_markup=reply_markup)
+        await query.message.reply_text(
+            f"🎁 جلسه {session_no} از پکیج {PACKAGES[pkg_code]['title']} برای این نوبت استفاده شد.\n"
+            "نوبت شما بدون پرداخت اضافه ثبت گردید.",
+            reply_markup=back_main_kb(),
+        )
+        return
 
-async def show_doctors(update, context):
-    """نمایش لیست پزشکان"""
-    query = update.callback_query
-    await safe_answer_query(query)
-    
-    doctors_text = "👨‍⚕️ **تیم پزشکی کلینیک گلوریا**\n\n"
-    doctors_text += "**۱. دکتر مریم احمدی**\n📋 پوست و زیبایی\n⭐ ۱۲ سال سابقه\n\n"
-    doctors_text += "**۲. دکتر سارا محمدی**\n📋 لیزر و زیبایی\n⭐ ۱۰ سال سابقه\n\n"
-    doctors_text += "**۳. دکتر حمید کریمی**\n📋 تزریقات زیبایی\n⭐ ۷ سال سابقه\n\n"
-    doctors_text += "**۴. دکتر علی رضایی**\n📋 کاشت مو\n⭐ ۸ سال سابقه"
-    
-    keyboard = [
-        [InlineKeyboardButton("📅 رزرو نوبت", callback_data="menu_booking")],
-        [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="back_to_main")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(doctors_text, reply_markup=reply_markup)
+    # ---------- نوبت‌های من ----------
+    if data == "menu_my_appts":
+        user = get_user_by_chat(chat_id)
+        if not user:
+            await query.message.reply_text("ابتدا باید ثبت‌نام کنید. /start", reply_markup=back_main_kb())
+            return
+        appts = get_user_appointments(user["id"], limit=10)
+        if not appts:
+            await query.message.reply_text("هیچ نوبتی برای شما ثبت نشده است.", reply_markup=back_main_kb())
+            return
+        lines = []
+        for a in appts:
+            pkg_part = ""
+            if a["status"] == "package":
+                pkg_part = f" (پکیج، جلسه {a['package_session']})"
+            lines.append(
+                f"#{a['id']} | {a['service_title']}{pkg_part} | {a['date']} {a['time']} | وضعیت: {a['status']}"
+            )
+        await query.message.reply_text("نوبت‌های شما:\n\n" + "\n".join(lines), reply_markup=back_main_kb())
+        return
 
-# ==================== MAIN FUNCTION ====================
+    # ---------- پروفایل ----------
+    if data == "menu_profile":
+        user = get_user_by_chat(chat_id)
+        if not user:
+            await query.message.reply_text("ابتدا باید ثبت‌نام کنید. /start", reply_markup=back_main_kb())
+            return
+        tags = user["tags"] or ""
+        tags_view = tags if tags else "—"
+        clinic = get_clinic(user["clinic_id"]) if user["clinic_id"] else None
+        clinic_name = clinic["name"] if clinic else "ثبت نشده"
+        next_appt = get_upcoming_appointment(user["id"])
+        lines = [
+            f"👤 نام: {user['full_name']}",
+            f"☎️ شماره: {user['phone_number'] or 'ثبت نشده'}",
+            f"🏥 کلینیک: {clinic_name}",
+            f"🏷 برچسب‌ها: {tags_view}",
+            f"🎁 کد معرف اختصاصی شما: {user['referral_code']}",
+        ]
+        if next_appt:
+            lines += [
+                "",
+                "🗓 نزدیک‌ترین نوبت شما:",
+                f"- {next_appt['service_title']} با {next_appt['doctor_name']}",
+                f"- تاریخ: {next_appt['date']} ساعت {next_appt['time']}",
+                f"- وضعیت: {next_appt['status']}",
+            ]
+        await query.message.reply_text("\n".join(lines), reply_markup=back_main_kb())
+        return
+
+    # ---------- Referral ----------
+    if data == "menu_referral":
+        user = get_user_by_chat(chat_id)
+        if not user:
+            await query.message.reply_text("ابتدا باید ثبت‌نام کنید. /start", reply_markup=back_main_kb())
+            return
+
+        bot_username = (await query.get_bot()).username
+        link = f"https://t.me/{bot_username}?start={user['referral_code']}"
+
+        text = (
+            "🎁 سیستم معرف:\n\n"
+            f"کد معرف اختصاصی شما:\n`{user['referral_code']}`\n\n"
+            "می‌توانید این لینک را برای دوستان خود بفرستید:\n"
+            f"{link}\n\n"
+            "هر کسی با این لینک یا کد ثبت‌نام کند، برای شما امتیاز معرف ثبت می‌شود. 🌸"
+        )
+
+        buttons = [
+            [InlineKeyboardButton("ثبت کد معرف که از کسی گرفته‌ام", callback_data="enter_referral")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
+        ]
+
+        await query.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "enter_referral":
+        context.user_data["state"] = STATE_AWAITING_REFERRAL_CODE
+        await query.message.reply_text(
+            "لطفاً کد معرف شخصی که شما را معرفی کرده وارد کنید:\n\n"
+            "مثال: GL123456789\n\n"
+            "اگر کدی ندارید، می‌توانید به منوی اصلی برگردید.",
+            reply_markup=back_main_kb(),
+        )
+        return
+
+    # ---------- FAQ ----------
+    if data == "menu_faq":
+        await query.message.reply_text("سوالات پرتکرار را انتخاب کنید:", reply_markup=faq_kb())
+        return
+
+    if data.startswith("faq_"):
+        if data == "faq_before_laser":
+            txt = (
+                "❓ قبل از لیزر چه کارهایی انجام دهم؟\n\n"
+                "• از آفتاب و سولاریوم حداقل دو هفته قبل خودداری کنید.\n"
+                "• از کرم‌های برنزه‌کننده روی ناحیه هدف استفاده نکنید.\n"
+                "• ناحیه را ۲۴ ساعت قبل اصلاح کنید (در صورت دستور کلینیک).\n"
+                "• بدون کرم و آرایش به جلسه لیزر مراجعه کنید."
+            )
+        elif data == "faq_after_laser":
+            txt = (
+                "❓ بعد از لیزر چه مراقبت‌هایی لازم است؟\n\n"
+                "• تا ۴۸ ساعت از آفتاب مستقیم، سونا و حمام داغ خودداری کنید.\n"
+                "• از کرم ترمیم‌کننده و ضدآفتاب طبق دستور پزشک استفاده کنید.\n"
+                "• در صورت قرمزی خفیف، از کمپرس سرد ملایم استفاده کنید."
+            )
+        else:  # faq_after_meso
+            txt = (
+                "❓ بعد از مزوتراپی چه عوارضی طبیعی است؟\n\n"
+                "• قرمزی خفیف، حساسیت لمس و گاهی کبودی کوچک طبیعی است.\n"
+                "• معمولاً طی چند روز برطرف می‌شود.\n"
+                "• در صورت درد شدید، تورم زیاد یا علائم غیرعادی حتماً با کلینیک تماس بگیرید."
+            )
+        await query.message.reply_text(txt, reply_markup=faq_kb())
+        return
+
+    # ---------- About ----------
+    if data == "menu_about":
+        text = (
+            f"ℹ️ درباره {CLINIC_NAME}\n\n"
+            "این نسخه PRO ربات با امکانات رزرو، CRM، پکیج درمانی، چند شعبه و سیستم معرف است.\n"
+        )
+        await query.message.reply_text(text, reply_markup=back_main_kb())
+        return
+
+    # ---------- Payment menu ----------
+    if data == "menu_payment":
+        user = get_user_by_chat(chat_id)
+        if not user:
+            await query.message.reply_text("ابتدا باید ثبت‌نام کنید. /start", reply_markup=back_main_kb())
+            return
+        appts = get_user_appointments(user["id"], limit=10)
+        if not appts:
+            await query.message.reply_text("نوبتی برای پرداخت وجود ندارد.", reply_markup=back_main_kb())
+            return
+        buttons = []
+        for a in appts:
+            label = f"#{a['id']} - {a['service_title']} - {a['date']} {a['time']} ({a['status']})"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"pay_appt_{a['id']}")])
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")])
+        await query.message.reply_text(
+            "نوبت موردنظر برای پرداخت را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("pay_appt_"):
+        appt_id = int(data.replace("pay_appt_", ""))
+        appt = get_appointment_by_id(appt_id)
+        if not appt:
+            await query.message.reply_text("❌ نوبت یافت نشد.", reply_markup=back_main_kb())
+            return
+        if appt["status"] == "package":
+            await query.message.reply_text(
+                "این نوبت از پکیج استفاده کرده و نیازی به پرداخت ندارد.",
+                reply_markup=back_main_kb(),
+            )
+            return
+        service_code = appt["service_code"]
+        service_title = appt["service_title"]
+        amount = SERVICES.get(service_code, {}).get("price", 500_000)
+        text = (
+            f"نوبت انتخاب‌شده:\n"
+            f"خدمت: {service_title}\n"
+            f"پزشک: {appt['doctor_name']}\n"
+            f"تاریخ: {appt['date']} ساعت {appt['time']}\n"
+            f"مبلغ: {amount:,} تومان\n\n"
+            "روش پرداخت را انتخاب کنید:\n"
+            f"💳 پرداخت آفلاین (کارت به کارت به شماره کارت {CARD_NUMBER} به نام {CARD_OWNER})\n"
+            "پس از واریز، رسید را ارسال کنید.\n\n"
+            "یا پرداخت آنلاین (فعلاً بدون اتصال مستقیم به درگاه؛ فقط ثبت درخواست پرداخت در سیستم)."
+        )
+        buttons = [
+            [InlineKeyboardButton("📷 ارسال رسید (آفلاین)", callback_data=f"pay_offline_{appt_id}")],
+            [InlineKeyboardButton("💳 ثبت پرداخت آنلاین", callback_data=f"pay_online_{appt_id}")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="menu_payment")],
+        ]
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("pay_offline_"):
+        appt_id = int(data.replace("pay_offline_", ""))
+        context.user_data["state"] = STATE_AWAITING_RECEIPT_PHOTO
+        context.user_data["receipt_appt_id"] = appt_id
+        await query.message.reply_text(
+            f"لطفاً مبلغ را به شماره کارت {CARD_NUMBER} به نام {CARD_OWNER} واریز کرده و سپس تصویر رسید را ارسال کنید.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="back_to_main")]]),
+        )
+        return
+
+    if data.startswith("pay_online_"):
+        appt_id = int(data.replace("pay_online_", ""))
+        user = get_user_by_chat(chat_id)
+        if not user:
+            await query.message.reply_text("ابتدا باید ثبت‌نام کنید. /start", reply_markup=back_main_kb())
+            return
+        appt = get_appointment_by_id(appt_id)
+        if not appt:
+            await query.message.reply_text("❌ نوبت یافت نشد.", reply_markup=back_main_kb())
+            return
+        service_code = appt["service_code"]
+        amount = SERVICES.get(service_code, {}).get("price", 500_000)
+
+        # فقط ثبت به‌عنوان "درخواست پرداخت آنلاین" با وضعیت pending
+        authority = f"AUTH-{random.randint(100000, 999999)}"
+        create_payment(
+            user_id=appt["user_id"],
+            clinic_id=appt["clinic_id"],
+            appointment_id=appt_id,
+            amount=amount,
+            method="online",
+            status="pending",
+            receipt_file_id=None,
+            online_authority=authority,
+        )
+
+        await query.message.reply_text(
+            "✅ درخواست پرداخت آنلاین شما ثبت شد.\n"
+            "در این نسخه‌ی ربات، اتصال مستقیم به درگاه واقعی انجام نشده و پرداخت توسط ادمین در سیستم تأیید می‌شود.\n\n"
+            f"کد پیگیری داخلی: {authority}",
+            reply_markup=back_main_kb(),
+        )
+        return
+
+    # ---------- Consultation ----------
+    if data == "menu_consult":
+        buttons = [
+            [
+                InlineKeyboardButton("نرمال", callback_data="c_skin_normal"),
+                InlineKeyboardButton("خشک", callback_data="c_skin_dry"),
+            ],
+            [
+                InlineKeyboardButton("چرب", callback_data="c_skin_oily"),
+                InlineKeyboardButton("مختلط", callback_data="c_skin_combo"),
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")],
+        ]
+        await query.message.reply_text("نوع پوست خود را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("c_skin_"):
+        skin = data.replace("c_skin_", "")
+        context.user_data["c_skin"] = skin
+        buttons = [
+            [
+                InlineKeyboardButton("جوش/آکنه", callback_data="c_prob_acne"),
+                InlineKeyboardButton("لک/تیرگی", callback_data="c_prob_spots"),
+            ],
+            [
+                InlineKeyboardButton("چروک/پیری", callback_data="c_prob_aging"),
+                InlineKeyboardButton("حساسیت/قرمزی", callback_data="c_prob_sensitive"),
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="menu_consult")],
+        ]
+        await query.message.reply_text("بیشترین مشکل پوست شما چیست؟", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("c_prob_"):
+        prob = data.replace("c_prob_", "")
+        context.user_data["c_prob"] = prob
+        buttons = [
+            [
+                InlineKeyboardButton("کم", callback_data="c_sens_low"),
+                InlineKeyboardButton("متوسط", callback_data="c_sens_medium"),
+                InlineKeyboardButton("زیاد", callback_data="c_sens_high"),
+            ],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="menu_consult")],
+        ]
+        await query.message.reply_text(
+            "میزان حساسیت پوست خود را مشخص کنید:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("c_sens_"):
+        sens = data.replace("c_sens_", "")
+        context.user_data["c_sens"] = sens
+        user = get_user_by_chat(chat_id)
+        skin = context.user_data.get("c_skin", "")
+        prob = context.user_data.get("c_prob", "")
+        if user:
+            create_consultation(user["id"], user["clinic_id"], skin, prob, sens)
+        answer = build_consultation_answer(skin, prob, sens)
+        await query.message.reply_text(answer, reply_markup=back_main_kb())
+        return
+
+    # ---------- Admin login ----------
+    if data == "menu_admin_login":
+        context.user_data["state"] = STATE_ADMIN_USERNAME
+        await query.message.reply_text(
+            "👮‍♀️ لطفاً نام کاربری ادمین را ارسال کنید:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data="back_to_main")]]),
+        )
+        return
+
+    # ---------- Admin panel ----------
+    if data in ("admin_panel", "admin_dashboard"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        users_count, appts_count, appts_done, revenue, top_ref = get_stats()
+        text = (
+            "📊 داشبورد مدیریت:\n\n"
+            f"👥 تعداد کاربران: {users_count}\n"
+            f"🗓 کل نوبت‌ها: {appts_count}\n"
+            f"✅ نوبت‌های نهایی (پرداخت/پکیج): {appts_done}\n"
+            f"💰 مجموع پرداخت‌های تأییدشده: {revenue:,} تومان\n"
+        )
+        if top_ref:
+            text += "\n🏆 برترین معرف‌ها:\n"
+            for r in top_ref:
+                text += f"- {r['full_name']} ({r['referral_points']} امتیاز)\n"
+        await query.message.reply_text(text, reply_markup=admin_main_kb())
+        return
+
+    if data == "admin_logout":
+        context.user_data["is_admin"] = False
+        await query.message.reply_text("از پنل مدیریت خارج شدید.", reply_markup=back_main_kb())
+        return
+
+    if data == "admin_users":
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        users = get_last_users()
+        if not users:
+            await query.message.reply_text("هیچ کاربری ثبت نشده است.", reply_markup=admin_back_kb())
+            return
+        buttons = []
+        for u in users:
+            label = f"#{u['id']} | {u['full_name']} ({u['phone_number'] or '-'})"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"admin_user_{u['id']}")])
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_panel")])
+        await query.message.reply_text("لیست آخرین کاربران:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("admin_user_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        uid = int(data.replace("admin_user_", ""))
+        u = get_user_by_id(uid)
+        if not u:
+            await query.message.reply_text("کاربر یافت نشد.", reply_markup=admin_back_kb())
+            return
+        clinic = get_clinic(u["clinic_id"]) if u["clinic_id"] else None
+        clinic_name = clinic["name"] if clinic else "ثبت نشده"
+        notes = get_crm_notes_for_user(uid)
+        tags = u["tags"] or ""
+        tag_view = tags if tags else "—"
+        lines = [
+            f"👤 {u['full_name']}",
+            f"☎️ {u['phone_number'] or '-'}",
+            f"🏥 کلینیک: {clinic_name}",
+            f"🏷 برچسب‌ها: {tag_view}",
+            f"🎁 کد معرف: {u['referral_code']}",
+            f"⭐️ امتیاز معرف: {u['referral_points']}",
+            "",
+            f"⚠️ حساسیت‌ها / هشدارها:\n{u['allergies'] or 'ثبت نشده'}",
+            "",
+            "یادداشت‌های CRM:",
+        ]
+        if notes:
+            for n in notes:
+                lines.append(f"- {n['note']}")
+        else:
+            lines.append("یادداشتی ثبت نشده است.")
+        buttons = [
+            [
+                InlineKeyboardButton("⭐ افزودن VIP", callback_data=f"admin_tag_vip_{u['chat_id']}"),
+                InlineKeyboardButton("🚫 بلاک کردن", callback_data=f"admin_tag_block_{u['chat_id']}"),
+            ],
+            [
+                InlineKeyboardButton("✏️ افزودن یادداشت", callback_data=f"crm_add_{uid}"),
+                InlineKeyboardButton("⚕️ ثبت حساسیت‌ها", callback_data=f"allergy_{uid}"),
+            ],
+            [InlineKeyboardButton("📂 پرونده کامل بیمار", callback_data=f"fullrec_{uid}")],
+            [InlineKeyboardButton("➕ اختصاص پکیج", callback_data=f"assignpkg_{uid}")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_users")],
+        ]
+        await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("allergy_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        uid = int(data.replace("allergy_", ""))
+        context.user_data["state"] = STATE_AWAITING_ALLERGIES
+        context.user_data["allergy_target_user_id"] = uid
+        await query.message.reply_text(
+            "متن حساسیت‌ها / هشدارهای مهم بیمار را ارسال کنید:",
+            reply_markup=admin_back_kb(),
+        )
+        return
+
+    if data.startswith("crm_add_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        uid = int(data.replace("crm_add_", ""))
+        context.user_data["state"] = STATE_AWAITING_CRM_NOTE
+        context.user_data["crm_target_user_id"] = uid
+        await query.message.reply_text("متن یادداشت CRM را ارسال کنید:", reply_markup=admin_back_kb())
+        return
+
+    if data.startswith("fullrec_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        uid = int(data.replace("fullrec_", ""))
+        u = get_user_by_id(uid)
+        if not u:
+            await query.message.reply_text("کاربر یافت نشد.", reply_markup=admin_back_kb())
+            return
+        clinic = get_clinic(u["clinic_id"]) if u["clinic_id"] else None
+        clinic_name = clinic["name"] if clinic else "ثبت نشده"
+
+        appts = get_user_appointments(uid, limit=20)
+        cons_list = get_last_consultations(limit=100)
+        cons_for_user = [c for c in cons_list if c["user_id"] == uid]
+        notes = get_crm_notes_for_user(uid, limit=20)
+
+        lines = [
+            f"📂 پرونده کامل بیمار #{u['id']}",
+            f"👤 {u['full_name']}",
+            f"☎️ {u['phone_number'] or '-'}",
+            f"🏥 کلینیک: {clinic_name}",
+            f"🏷 برچسب‌ها: {u['tags'] or '—'}",
+            f"⚠️ حساسیت‌ها: {u['allergies'] or 'ثبت نشده'}",
+            f"🎁 کد معرف: {u['referral_code']}",
+            f"⭐️ امتیاز معرف: {u['referral_points']}",
+            "",
+            "🗓 نوبت‌ها:",
+        ]
+        if appts:
+            for a in appts:
+                pkg_part = ""
+                if a["status"] == "package":
+                    pkg_part = f" (پکیج، جلسه {a['package_session']})"
+                lines.append(
+                    f"- {a['date']} {a['time']} | {a['service_title']} با {a['doctor_name']} | {a['status']}{pkg_part}"
+                )
+        else:
+            lines.append("هیچ نوبتی ثبت نشده است.")
+
+        lines.append("")
+        lines.append("🩺 مشاوره‌های پوستی:")
+        if cons_for_user:
+            for c in cons_for_user:
+                lines.append(
+                    f"- پوست: {c['skin_type']} | مشکل: {c['problem']} | حساسیت: {c['sensitivity']}"
+                )
+        else:
+            lines.append("هیچ مشاوره‌ای ثبت نشده است.")
+
+        lines.append("")
+        lines.append("📓 یادداشت‌های CRM:")
+        if notes:
+            for n in notes:
+                lines.append(f"- {n['note']}")
+        else:
+            lines.append("هیچ یادداشتی ثبت نشده است.")
+
+        await query.message.reply_text("\n".join(lines), reply_markup=admin_back_kb())
+        return
+
+    if data.startswith("assignpkg_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        uid = int(data.replace("assignpkg_", ""))
+        u = get_user_by_id(uid)
+        if not u:
+            await query.message.reply_text("کاربر یافت نشد.", reply_markup=admin_back_kb())
+            return
+        buttons = []
+        for code, info in PACKAGES.items():
+            label = f"{info['title']} ({info['total_sessions']} جلسه)"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"assignpkg2_{uid}_{code}")])
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data=f"admin_user_{uid}")])
+        await query.message.reply_text("پکیج مورد نظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("assignpkg2_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kk())
+            return
+        _, uid_str, code = data.split("_", 2)
+        uid = int(uid_str)
+        u = get_user_by_id(uid)
+        if not u:
+            await query.message.reply_text("کاربر یافت نشد.", reply_markup=admin_back_kb())
+            return
+        create_user_package(uid, u["clinic_id"], code)
+        await query.message.reply_text(
+            f"✅ پکیج {PACKAGES[code]['title']} برای بیمار ثبت شد.",
+            reply_markup=admin_back_kb(),
+        )
+        return
+
+    if data.startswith("admin_tag_vip_"):
+        chat_id_target = int(data.replace("admin_tag_vip_", ""))
+        set_user_tag(chat_id_target, "VIP", add=True)
+        await query.message.reply_text("✅ کاربر به‌عنوان VIP برچسب‌گذاری شد.", reply_markup=admin_back_kb())
+        return
+
+    if data.startswith("admin_tag_block_"):
+        chat_id_target = int(data.replace("admin_tag_block_", ""))
+        set_user_tag(chat_id_target, "BLOCKED", add=True)
+        await query.message.reply_text("✅ کاربر به‌عنوان بلاک‌شده برچسب‌گذاری شد.", reply_markup=admin_back_kb())
+        return
+
+    if data == "admin_appts":
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        appts = get_last_appointments()
+        if not appts:
+            await query.message.reply_text("هیچ نوبتی ثبت نشده است.", reply_markup=admin_back_kb())
+            return
+        lines = []
+        for a in appts:
+            pkg_part = ""
+            if a["status"] == "package":
+                pkg_part = f" (پکیج، جلسه {a['package_session']})"
+            lines.append(
+                f"#{a['id']} | {a['clinic_name']} | {a['full_name']} | {a['service_title']}{pkg_part} | {a['date']} {a['time']} | {a['status']}"
+            )
+        await query.message.reply_text("آخرین نوبت‌ها:\n\n" + "\n".join(lines), reply_markup=admin_back_kb())
+        return
+
+    if data == "admin_calendar":
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        appts = get_upcoming_appointments(days_ahead=14)
+        if not appts:
+            await query.message.reply_text("در ۱۴ روز آینده نوبتی ثبت نشده است.", reply_markup=admin_back_kb())
+            return
+        lines = ["📆 نوبت‌های ۱۴ روز آینده:\n"]
+        for a in appts:
+            lines.append(
+                f"- {a['date']} {a['time']} | {a['clinic_name']} | {a['service_title']} | {a['full_name']} | {a['doctor_name']} (#{a['id']})"
+            )
+        await query.message.reply_text("\n".join(lines), reply_markup=admin_back_kb())
+        return
+
+    if data == "admin_payments":
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        pays = get_last_payments()
+        if not pays:
+            await query.message.reply_text("هیچ پرداختی ثبت نشده است.", reply_markup=admin_back_kb())
+            return
+        buttons = []
+        for p in pays:
+            label = f"#{p['id']} | {p['clinic_name']} | {p['full_name']} | {p['amount']:,} | {p['method']} | {p['status']}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"admin_pay_{p['id']}")])
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_panel")])
+        await query.message.reply_text("آخرین پرداخت‌ها:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("admin_pay_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        pid = int(data.replace("admin_pay_", ""))
+        p = get_payment_by_id(pid)
+        if not p:
+            await query.message.reply_text("پرداخت یافت نشد.", reply_markup=admin_back_kb())
+            return
+        u = get_user_by_id(p["user_id"])
+        a = get_appointment_by_id(p["appointment_id"]) if p["appointment_id"] else None
+        lines = [
+            f"پرداخت #{p['id']}",
+            f"بیمار: {u['full_name'] if u else '-'}",
+            f"کلینیک: {p['clinic_id']}",
+            f"مبلغ: {p['amount']:,} تومان",
+            f"روش: {p['method']}",
+            f"وضعیت: {p['status']}",
+        ]
+        if p["online_authority"]:
+            lines.append(f"کد پیگیری داخلی: {p['online_authority']}")
+        if a:
+            lines.append(f"نوبت مرتبط: #{a['id']} | {a['service_title']} | {a['date']} {a['time']}")
+        buttons = []
+        if p["status"] == "pending":
+            buttons.append(
+                [
+                    InlineKeyboardButton("✔ تأیید پرداخت", callback_data=f"admin_pay_ok_{p['id']}"),
+                    InlineKeyboardButton("❌ رد پرداخت", callback_data=f"admin_pay_rej_{p['id']}"),
+                ]
+            )
+        buttons.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_payments")])
+        await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("admin_pay_ok_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        pid = int(data.replace("admin_pay_ok_", ""))
+        p = get_payment_by_id(pid)
+        if not p:
+            await query.message.reply_text("پرداخت یافت نشد.", reply_markup=admin_back_kb())
+            return
+        update_payment_status(pid, "paid", ref_id=f"ADMIN-{pid}")
+        if p["appointment_id"]:
+            update_appointment_status(p["appointment_id"], "paid")
+            appt = get_appointment_by_id(p["appointment_id"])
+            add_service_tag_to_user(appt["user_id"], appt["service_code"])
+            user = get_user_by_id(appt["user_id"])
+            app: Application = context.application  # type: ignore
+            try:
+                await app.bot.send_message(
+                    chat_id=user["chat_id"],
+                    text=(
+                        f"✅ پرداخت نوبت شما برای {appt['service_title']} تأیید شد.\n"
+                        f"تاریخ: {appt['date']} ساعت {appt['time']}"
+                    ),
+                )
+            except Exception:
+                pass
+        await query.message.reply_text("✅ پرداخت به‌عنوان «تأیید شده» ثبت شد.", reply_markup=admin_back_kb())
+        return
+
+    if data.startswith("admin_pay_rej_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        pid = int(data.replace("admin_pay_rej_", ""))
+        p = get_payment_by_id(pid)
+        if not p:
+            await query.message.reply_text("پرداخت یافت نشد.", reply_markup=admin_back_kb())
+            return
+        update_payment_status(pid, "rejected", ref_id=None)
+        if p["appointment_id"]:
+            update_appointment_status(p["appointment_id"], "pending_payment")
+            appt = get_appointment_by_id(p["appointment_id"])
+            user = get_user_by_id(appt["user_id"])
+            app: Application = context.application  # type: ignore
+            try:
+                await app.bot.send_message(
+                    chat_id=user["chat_id"],
+                    text=(
+                        f"⚠️ پرداخت نوبت شما برای {appt['service_title']} تأیید نشد.\n"
+                        "در صورت بروز مشکل با کلینیک تماس بگیرید."
+                    ),
+                )
+            except Exception:
+                pass
+        await query.message.reply_text("پرداخت به‌عنوان «رد شده» ثبت شد.", reply_markup=admin_back_kb())
+        return
+
+    if data == "admin_consults":
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        cons = get_last_consultations()
+        if not cons:
+            await query.message.reply_text("هیچ مشاوره‌ای ثبت نشده است.", reply_markup=admin_back_kb())
+            return
+        lines = []
+        for c in cons:
+            lines.append(
+                f"#{c['id']} | {c['clinic_name']} | {c['full_name']} | پوست: {c['skin_type']} | مشکل: {c['problem']} | حساسیت: {c['sensitivity']}"
+            )
+        await query.message.reply_text("آخرین مشاوره‌ها:\n\n" + "\n".join(lines), reply_markup=admin_back_kb())
+        return
+
+    if data == "admin_packages":
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        lines = ["🎁 پکیج‌های تعریف‌شده:\n"]
+        for code, info in PACKAGES.items():
+            lines.append(
+                f"- {info['title']} | خدمت: {SERVICES[info['service_code']]['title']} | جلسات: {info['total_sessions']} | قیمت پیشنهادی: {info['price']:,}"
+            )
+        await query.message.reply_text("\n".join(lines), reply_markup=admin_back_kb())
+        return
+
+    if data == "admin_broadcast":
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        buttons = [
+            [InlineKeyboardButton("همه کاربران", callback_data="bc_ALL")],
+            [InlineKeyboardButton("فقط VIP", callback_data="bc_VIP")],
+            [InlineKeyboardButton("بیماران بوتاکس", callback_data="bc_Botox")],
+            [InlineKeyboardButton("بیماران لیزر", callback_data="bc_Laser")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_panel")],
+        ]
+        await query.message.reply_text(
+            "گروه هدف برای پیام گروهی را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("bc_"):
+        if not context.user_data.get("is_admin"):
+            await query.message.reply_text("شما به پنل مدیریت دسترسی ندارید.", reply_markup=back_main_kb())
+            return
+        seg = data.replace("bc_", "")
+        context.user_data["state"] = STATE_AWAITING_BROADCAST_TEXT
+        context.user_data["broadcast_segment"] = "ALL" if seg == "ALL" else seg
+        await query.message.reply_text(
+            "متن پیامی که می‌خواهید برای این گروه ارسال شود را بفرستید:",
+            reply_markup=admin_back_kb(),
+        )
+        return
+
+
+# ==================== Reminder Job ====================
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    app: Application = context.application  # type: ignore
+    now = datetime.now()
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM appointments")
+    rows = c.fetchall()
+    conn.close()
+
+    for a in rows:
+        appt_dt = appointment_datetime(a)
+        if not appt_dt:
+            continue
+        user = get_user_by_id(a["user_id"])
+        if not user:
+            continue
+        chat_id = user["chat_id"]
+        delta = appt_dt - now
+
+        # 24h reminder
+        if a["pre24_sent"] == 0 and timedelta(hours=0) < delta <= timedelta(hours=24):
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⏰ یادآوری نوبت فردا:\n"
+                        f"{a['service_title']} با {a['doctor_name']}\n"
+                        f"تاریخ: {a['date']} ساعت {a['time']}"
+                    ),
+                )
+                conn2 = get_conn()
+                conn2.execute("UPDATE appointments SET pre24_sent = 1 WHERE id = ?", (a["id"],))
+                conn2.commit()
+                conn2.close()
+            except Exception as e:
+                logger.exception("24h reminder error: %s", e)
+
+        # 3h reminder
+        if a["pre3_sent"] == 0 and timedelta(hours=0) < delta <= timedelta(hours=3):
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⏰ یادآوری نوبت چند ساعت دیگر:\n"
+                        f"{a['service_title']} با {a['doctor_name']}\n"
+                        f"امروز ساعت {a['time']}"
+                    ),
+                )
+                conn2 = get_conn()
+                conn2.execute("UPDATE appointments SET pre3_sent = 1 WHERE id = ?", (a["id"],))
+                conn2.commit()
+                conn2.close()
+            except Exception as e:
+                logger.exception("3h reminder error: %s", e)
+
+        # Post-care 3h بعد نوبت
+        if a["postcare_sent"] == 0 and now >= appt_dt + timedelta(hours=3):
+            try:
+                txt = f"✨ مراقبت‌های بعد از درمان برای {a['service_title']}:\n"
+                if a["service_code"] == "laser":
+                    txt += "• تا ۴۸ ساعت از آفتاب مستقیم، سونا و حمام داغ خودداری کنید.\n• از کرم ترمیم‌کننده و ضدآفتاب استفاده کنید."
+                elif a["service_code"] == "botox":
+                    txt += "• تا ۴ ساعت دراز نکشید و ناحیه را ماساژ ندهید.\n• از فعالیت شدید بدنی تا چند ساعت خودداری کنید."
+                elif a["service_code"] == "clean":
+                    txt += "• تا ۲۴ ساعت از آرایش سنگین و اسکراب پرهیز کنید.\n• از مرطوب‌کننده و ضدآفتاب ملایم استفاده کنید."
+                elif a["service_code"] == "meso":
+                    txt += "• ممکن است کمی قرمزی و تورم خفیف داشته باشید که طی چند روز برطرف می‌شود.\n• از آفتاب مستقیم و سونا خودداری کنید."
+                else:
+                    txt += "• در صورت هرگونه نگرانی یا سوال، با کلینیک تماس بگیرید."
+                await app.bot.send_message(chat_id=chat_id, text=txt)
+                conn2 = get_conn()
+                conn2.execute("UPDATE appointments SET postcare_sent = 1 WHERE id = ?", (a["id"],))
+                conn2.commit()
+                conn2.close()
+            except Exception as e:
+                logger.exception("post-care error: %s", e)
+
+        # Rating 1d بعد
+        if a["rating_sent"] == 0 and now >= appt_dt + timedelta(days=1):
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⭐️ از ۱ تا ۵، رضایت شما از نوبت {a['service_title']} در تاریخ {a['date']} چقدر بود؟\n"
+                        "می‌توانید عدد را برای ما ارسال کنید."
+                    ),
+                )
+                conn2 = get_conn()
+                conn2.execute("UPDATE appointments SET rating_sent = 1 WHERE id = ?", (a["id"],))
+                conn2.commit()
+                conn2.close()
+            except Exception as e:
+                logger.exception("rating reminder error: %s", e)
+
+        # Recall
+        svc = SERVICES.get(a["service_code"], {})
+        recall_days = svc.get("recall_days")
+        if recall_days and a["recall_sent"] == 0 and now >= appt_dt + timedelta(days=recall_days):
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⏰ یادآوری دوره‌ای:\n"
+                        f"از آخرین {a['service_title']} شما مدتی گذشته است.\n"
+                        "در صورت تمایل می‌توانیم برای تمدید نوبت جدید تنظیم کنیم. 🌿"
+                    ),
+                )
+                conn2 = get_conn()
+                conn2.execute("UPDATE appointments SET recall_sent = 1 WHERE id = ?", (a["id"],))
+                conn2.commit()
+                conn2.close()
+            except Exception as e:
+                logger.exception("recall error: %s", e)
+
+
+# ==================== main ====================
 
 def main():
-    """تابع اصلی"""
-    # ابتدا دیتابیس را مقداردهی اولیه کن
     init_db()
-    
-    # تنظیمات اتصال
-    application = Application.builder().token(TOKEN).build()
-    
-    # هندلرهای اصلی
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # هندلر آپلود فیش
-    application.add_handler(MessageHandler(filters.PHOTO, handle_receipt_photo))
-    
-    # هندلرهای منوی اصلی
-    application.add_handler(CallbackQueryHandler(show_main_menu, pattern='^back_to_main$'))
-    application.add_handler(CallbackQueryHandler(show_beauty_services, pattern='^menu_beauty$'))
-    application.add_handler(CallbackQueryHandler(show_beauty_services, pattern='^menu_booking$'))
-    application.add_handler(CallbackQueryHandler(show_contact_info, pattern='^menu_contact$'))
-    application.add_handler(CallbackQueryHandler(show_guide, pattern='^menu_guide$'))
-    application.add_handler(CallbackQueryHandler(show_doctors, pattern='^menu_doctors$'))
-    
-    # هندلرهای ادمین ساده
-    application.add_handler(CallbackQueryHandler(start_admin_login_simple, pattern='^admin_login_simple$'))
-    application.add_handler(CallbackQueryHandler(show_admin_panel_simple, pattern='^admin_panel_simple$'))
-    application.add_handler(CallbackQueryHandler(admin_logout_simple, pattern='^admin_logout_simple$'))
-    application.add_handler(CallbackQueryHandler(admin_view_appointments, pattern='^admin_view_appointments$'))
-    application.add_handler(CallbackQueryHandler(admin_view_payments, pattern='^admin_view_payments$'))
-    application.add_handler(CallbackQueryHandler(admin_view_users, pattern='^admin_view_users$'))
-    application.add_handler(CallbackQueryHandler(admin_view_stats, pattern='^admin_view_stats$'))
-    
-    # هندلرهای خدمات زیبایی
-    application.add_handler(CallbackQueryHandler(show_laser_services, pattern='^laser_services$'))
-    application.add_handler(CallbackQueryHandler(show_laser_by_gender, pattern='^(laser_women|laser_men)$'))
-    application.add_handler(CallbackQueryHandler(handle_category_selection, pattern='^category_'))
-    
-    # هندلرهای رزرو نوبت
-    application.add_handler(CallbackQueryHandler(handle_service_selection_booking, pattern='^book_service_'))
-    application.add_handler(CallbackQueryHandler(handle_doctor_selection_calendar, pattern='^book_doctor_'))
-    application.add_handler(CallbackQueryHandler(handle_date_selection, pattern='^book_date_'))
-    application.add_handler(CallbackQueryHandler(handle_time_selection, pattern='^book_time_'))
-    
-    # هندلر پرداخت
-    application.add_handler(CallbackQueryHandler(start_payment_with_receipt, pattern='^payment_receipt$'))
-    
-    logger.info("Bot is starting with simple admin system...")
-    
-    try:
-        application.run_polling(
-            poll_interval=3.0,
-            timeout=30,
-            drop_pending_updates=True
-        )
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-        asyncio.run(asyncio.sleep(5))
-        main()
 
-if __name__ == '__main__':
-    main()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(callback_router))
+    application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    job_queue = application.job_queue
+    job_queue.run_repeating(reminder_job, interval=600, first=60)
+
+    logger.info("PRO Bot started...")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("❕ ربات با دستور شما متوقف شد.")
