@@ -1,2 +1,1 @@
-python-telegram-bot==20.9
-jdatetime
+python-telegram-bot==22.5
