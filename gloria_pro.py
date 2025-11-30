@@ -2307,15 +2307,16 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    # JobQueue برای ریمایندرها
     job_queue = application.job_queue
-    job_queue.run_repeating(reminder_job, interval=600, first=60)
+    if job_queue is not None:
+        job_queue.run_repeating(reminder_job, interval=600, first=60)
+    else:
+        logger.warning(
+            "JobQueue در دسترس نیست. برای فعال شدن ریمایندر نوبت‌ها، "
+            'پکیج را با "python-telegram-bot[job-queue]" نصب کنید.'
+        )
 
     logger.info("PRO Bot started...")
     application.run_polling()
 
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("❕ ربات با دستور شما متوقف شد.")
